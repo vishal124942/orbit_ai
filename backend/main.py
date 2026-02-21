@@ -19,7 +19,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 from backend.pg_models import PlatformDB, close_pool
 from backend.session_manager import SessionManager
 from backend.auth import verify_google_token, create_session_token, decode_session_token, extract_token_from_header
-from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Header, Query
+from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Header, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
