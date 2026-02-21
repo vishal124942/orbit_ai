@@ -60,8 +60,9 @@ export const fetchMe = async () => {
 
 // ── WhatsApp ──────────────────────────────────────────────────────────────────
 
-export const startWaAgent = async () => {
-    const res = await api.post('/api/whatsapp/start')
+export const startWaAgent = async (phoneNumber = null) => {
+    const payload = phoneNumber ? { phone_number: phoneNumber } : {}
+    const res = await api.post('/api/whatsapp/start', payload)
     return res.data
 }
 

@@ -37,6 +37,7 @@ class UserAgentController:
         on_qr: Callable,
         on_status: Callable,
         on_contacts: Callable,
+        on_pairing_code: Callable = None,
     ):
         self.user_id = user_id
         self.config = config
@@ -44,6 +45,7 @@ class UserAgentController:
         self.on_qr_cb = on_qr
         self.on_status_cb = on_status
         self.on_contacts_cb = on_contacts
+        self.on_pairing_code_cb = on_pairing_code
 
         self.data_dir = config["_data_dir"]
         self.soul_override = config.get("_soul_override", "")
@@ -154,6 +156,7 @@ class UserAgentController:
             on_qr=self.on_qr_cb,
             on_status=self.on_status_cb,
             on_contacts=self.on_contacts_cb,
+            on_pairing_code=self.on_pairing_code_cb,
             loop=self._loop,
         )
 
@@ -199,6 +202,7 @@ class _IsolatedAgentController:
         on_qr: Callable,
         on_status: Callable,
         on_contacts: Callable,
+        on_pairing_code: Callable,
         loop: asyncio.AbstractEventLoop,
     ):
         import os
@@ -225,16 +229,16 @@ class _IsolatedAgentController:
         self.get_soul_fn = get_soul_fn
         self.update_soul_fn = update_soul_fn
         self.has_soul_fn = has_soul_fn
-        self._contact_tones = contact_tones  # Shared dict reference with UserAgentController
+        self._contact_tones = contact_tones
         self.on_qr_cb = on_qr
         self.on_status_cb = on_status
         self.on_contacts_cb = on_contacts
+        self.on_pairing_code_cb = on_pairing_code
         self.console = Console()
         self.loop = loop
 
         self.openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         
-        # Initialize Sarvam client for LLM-2 and fallbacks
         sarvam_key = os.getenv("SARVAM_API_KEY")
         self.sarvam_client = None
         if sarvam_key:
@@ -260,7 +264,6 @@ class _IsolatedAgentController:
 
         self.media_processor = MediaProcessor(self.openai_client, sticker_analyzer=self.sticker_analyzer)
 
-        # Use user-scoped TTS dir
         tts_dir = os.path.join(data_dir, "tts")
         self.media_responder = MediaResponder(self.openai_client, config)
         self.media_responder.tts_dir = tts_dir
@@ -274,13 +277,12 @@ class _IsolatedAgentController:
         self.debounce_lock = asyncio.Lock()
         self.media_hashes: Dict[str, str] = {}
 
-        # Setup WhatsApp bridge with user-scoped auth dir
         auth_dir = config.get("whatsapp", {}).get("auth_dir", os.path.join(data_dir, "whatsapp"))
-        self.wa_bridge = WhatsAppBridge(auth_dir)
+        phone_number = config.get("whatsapp", {}).get("phone_number")
+        self.wa_bridge = WhatsAppBridge(auth_dir, phone_number=phone_number, session_id=self.user_id)
         self._setup_wa()
-        self.status = {"whatsapp": "disconnected", "last_qr": None}
+        self.status = {"whatsapp": "disconnected", "last_qr": None, "pairing_code": None}
 
-        # Import pipeline constants
         from backend.src.core.agent_controller import (
             ORCHESTRATOR_SYSTEM_PROMPT, INTERACTIVE_SYSTEM_PROMPT
         )
@@ -292,6 +294,11 @@ class _IsolatedAgentController:
             self.status["last_qr"] = event["data"]
             self.status["whatsapp"] = "pairing"
             self.loop.call_soon_threadsafe(lambda: self.on_qr_cb(event["data"]))
+
+        def on_pairing_code(event):
+            self.status["pairing_code"] = event["code"]
+            self.status["whatsapp"] = "pairing"
+            self.loop.call_soon_threadsafe(lambda: self.on_pairing_code_cb(event["code"]))
 
         def on_connection(event):
             status = event["status"]

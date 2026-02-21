@@ -7,13 +7,16 @@ import time
 from typing import Optional, Callable
 
 class WhatsAppBridge:
-    def __init__(self, auth_dir: Optional[str] = None):
+    def __init__(self, auth_dir: Optional[str] = None, phone_number: Optional[str] = None, session_id: Optional[str] = None):
         self.auth_dir = auth_dir or os.path.expanduser('~/.ai-agent-system/credentials/whatsapp/default')
+        self.phone_number = phone_number
+        self.session_id = session_id
         self.gateway_script = os.path.join(os.path.dirname(__file__), 'gateway_v3.js')
         self.process: Optional[subprocess.Popen] = None
         self.event_queue = queue.Queue()
         self.callbacks = {
             'qr': None,
+            'pairing_code': None,
             'connection': None,
             'message': None,
             'error': None,
@@ -44,13 +47,17 @@ class WhatsAppBridge:
         print(f"🚀 Starting WhatsApp Gateway at {self.gateway_script}")
         
         # Pass the folder name as the Session ID for R2 storage
-        session_id = os.path.basename(self.auth_dir.rstrip('/'))
+        session_id = self.session_id or os.path.basename(self.auth_dir.rstrip('/'))
         env = os.environ.copy()
         env['WHATSAPP_SESSION_ID'] = session_id
         
         try:
+            args = ['node', self.gateway_script, self.auth_dir]
+            if self.phone_number:
+                args.append(self.phone_number)
+
             self.process = subprocess.Popen(
-                ['node', self.gateway_script, self.auth_dir],
+                args,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

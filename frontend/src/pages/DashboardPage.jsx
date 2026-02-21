@@ -135,8 +135,8 @@ export default function DashboardPage() {
                             key={tab.id}
                             onClick={() => setActiveTab(tab.id)}
                             className={`flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-medium transition-all duration-200 ${activeTab === tab.id
-                                    ? 'bg-board-accent text-board-900'
-                                    : 'text-gray-400 hover:text-gray-200 hover:bg-board-700'
+                                ? 'bg-board-accent text-board-900'
+                                : 'text-gray-400 hover:text-gray-200 hover:bg-board-700'
                                 }`}
                         >
                             {tab.icon}
@@ -151,6 +151,7 @@ export default function DashboardPage() {
                         <WhatsAppPanel
                             waStatus={waStatus}
                             qrCode={qrCode}
+                            pairingCode={pairingCode}
                             onStatusChange={setWaStatus}
                             onAnalyticsRefresh={loadAnalytics}
                         />

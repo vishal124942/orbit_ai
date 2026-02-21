@@ -177,6 +177,10 @@ async def wa_status(user: Dict = Depends(get_current_user)):
     return await session_manager.get_session_status(user["id"])
 
 
+class StartWaRequest(BaseModel):
+    phone_number: Optional[str] = None
+
+
 @app.get("/api/whatsapp/qr")
 async def wa_get_qr(user: Dict = Depends(get_current_user)):
     """
@@ -187,18 +191,22 @@ async def wa_get_qr(user: Dict = Depends(get_current_user)):
     status = await session_manager.get_session_status(user["id"])
     return {
         "status": status["status"],
-        "qr_code": status.get("qr_code"),     # None if not ready yet
+        "qr_code": status.get("qr_code"),
+        "pairing_code": status.get("pairing_code"),
         "has_qr": bool(status.get("qr_code")),
+        "has_pairing_code": bool(status.get("pairing_code")),
     }
 
 
 @app.post("/api/whatsapp/start")
-async def wa_start(user: Dict = Depends(get_current_user)):
+async def wa_start(req: StartWaRequest = Body(default=None), user: Dict = Depends(get_current_user)):
     status = await session_manager.get_session_status(user["id"])
     if status["status"] == "connected" and status["is_running"]:
         return {"message": "Agent already running", **status}
-    await session_manager.start_pairing(user["id"])
-    return {"message": "Agent starting. Poll /api/whatsapp/qr for QR code.", "status": "starting"}
+    
+    phone_number = req.phone_number if req else None
+    await session_manager.start_pairing(user["id"], phone_number=phone_number)
+    return {"message": "Agent starting. Poll /api/whatsapp/qr for QR code or pairing code.", "status": "starting"}
 
 
 @app.post("/api/whatsapp/stop")

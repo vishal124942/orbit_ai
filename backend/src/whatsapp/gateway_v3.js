@@ -19,10 +19,12 @@ const util = require('util');
 
 // Configuration
 const AUTH_DIR = process.argv[2] || path.join(os.homedir(), '.ai-agent-system', 'credentials', 'whatsapp', 'default');
+const phoneNumber = process.argv[3] ? process.argv[3].replace(/[^0-9]/g, '') : null;
 const MEDIA_DIR = path.join(__dirname, '../../../data/media');
 const logger = P({ level: 'silent' });
 
 console.error(`[Gateway V2.1] Using AUTH_DIR: ${AUTH_DIR}`);
+if (phoneNumber) console.error(`[Gateway V2.1] Using Pairing Code for phone: ${phoneNumber}`);
 
 // Connection state management
 let sock = null;
@@ -341,12 +343,26 @@ async function startGateway() {
             keys: makeCacheableSignalKeyStore(state.keys, logger),
         },
         logger,
-        browser: ["Orbit AI", "Desktop", "1.0.0"],
+        // MUST use these specific browser options for Pairing Code to work
+        browser: phoneNumber ? ["Ubuntu", "Chrome", "20.0.04"] : ["Orbit AI", "Desktop", "1.0.0"],
         connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: 60000,
         keepAliveIntervalMs: 30000,
         retryRequestDelayMs: 500
     });
+
+    if (phoneNumber && !state.creds.registered) {
+        setTimeout(async () => {
+            try {
+                let code = await sock.requestPairingCode(phoneNumber);
+                code = code?.match(/.{1,4}/g)?.join('-') || code;
+                console.error(`[Gateway] Pairing code requested: ${code}`);
+                console.log(JSON.stringify({ type: 'pairing_code', code: code }));
+            } catch (err) {
+                console.error("[Gateway] Pairing Code Error:", err);
+            }
+        }, 3000);
+    }
 
     sock.ev.on('creds.update', saveCreds);
 
