@@ -11,6 +11,7 @@ ENV WHATSAPP_BRIDGE_PATH=/app/backend/src/whatsapp/gateway_v3.js
 RUN apt-get update && apt-get install -y \
     curl \
     gnupg \
+    git \
     ffmpeg \
     build-essential \
     libpq-dev \
