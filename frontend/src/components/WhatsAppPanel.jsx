@@ -1,5 +1,4 @@
 import { useState, useEffect, useRef } from 'react'
-import { QRCodeSVG } from 'qrcode.react'
 import { Play, Square, Smartphone, CheckCircle, AlertCircle, Loader } from 'lucide-react'
 import { startWaAgent, stopWaAgent, useAuthStore } from '../lib/api'
 import axios from 'axios'
@@ -8,7 +7,7 @@ import axios from 'axios'
  * QR Poller — REST polling as the primary QR delivery mechanism.
  * Works even if WebSocket is flaky. Polls /api/whatsapp/qr every 2.5s.
  */
-function useQRPoller(enabled, onQR, onPairingCode, onConnected) {
+function useQRPoller(enabled, onPairingCode, onConnected) {
     const timerRef = useRef(null)
 
     useEffect(() => {
@@ -24,7 +23,6 @@ function useQRPoller(enabled, onQR, onPairingCode, onConnected) {
                     headers: { Authorization: `Bearer ${token}` },
                     timeout: 5000,
                 })
-                if (res.data.has_qr) onQR(res.data.qr_code)
                 if (res.data.has_pairing_code) onPairingCode(res.data.pairing_code)
                 if (res.data.status === 'connected') {
                     onConnected()
@@ -39,28 +37,23 @@ function useQRPoller(enabled, onQR, onPairingCode, onConnected) {
     }, [enabled])
 }
 
-export default function WhatsAppPanel({ waStatus, qrCode: wsQrCode, pairingCode: wsPairingCode, onStatusChange, onAnalyticsRefresh }) {
+export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, onStatusChange, onAnalyticsRefresh }) {
     const [loading, setLoading] = useState(false)
     const [message, setMessage] = useState('')
-    const [polledQR, setPolledQR] = useState(null)
     const [polledPairingCode, setPolledPairingCode] = useState(null)
     const [phoneNumber, setPhoneNumber] = useState('')
-    const [usePairingCode, setUsePairingCode] = useState(false)
 
     // Primary source: REST polling. Secondary: WebSocket push.
-    const activeQR = polledQR || wsQrCode
     const activePairingCode = polledPairingCode || wsPairingCode
 
     useQRPoller(
         waStatus === 'pairing',
-        setPolledQR,
         setPolledPairingCode,
         () => { onStatusChange('connected'); onAnalyticsRefresh?.() }
     )
 
     useEffect(() => {
         if (waStatus === 'connected') {
-            setPolledQR(null)
             setPolledPairingCode(null)
         }
     }, [waStatus])
@@ -69,18 +62,29 @@ export default function WhatsAppPanel({ waStatus, qrCode: wsQrCode, pairingCode:
     const isPairing = waStatus === 'pairing'
     const isDisconnected = waStatus === 'disconnected'
 
+    // Format phone number to only allow + and digits
+    const handlePhoneChange = (e) => {
+        let val = e.target.value;
+        // Strip everything except + and numbers. Ensure + only at start.
+        val = val.replace(/[^\d+]/g, '');
+        if (val.indexOf('+') > 0) {
+            val = val.replace(/\+/g, '');
+        }
+        setPhoneNumber(val);
+    }
+
     const handleStart = async () => {
         setLoading(true)
         setMessage('')
-        if (usePairingCode && !phoneNumber.trim()) {
-            setMessage('Please enter your phone number to use a pairing code.')
+        if (!phoneNumber.trim() || phoneNumber.replace(/\D/g, '').length < 10) {
+            setMessage('Please enter a valid phone number with your country code (e.g. +917310885365).')
             setLoading(false)
             return
         }
         try {
-            await startWaAgent(usePairingCode ? phoneNumber.trim() : null)
+            await startWaAgent(phoneNumber.trim())
             onStatusChange('pairing')
-            setMessage('Starting... ' + (usePairingCode ? 'Pairing code' : 'QR code') + ' will appear shortly.')
+            setMessage('Starting... Pairing code will appear shortly.')
         } catch (e) {
             setMessage(e.response?.data?.detail || 'Failed to start agent')
         } finally {
@@ -93,7 +97,6 @@ export default function WhatsAppPanel({ waStatus, qrCode: wsQrCode, pairingCode:
         try {
             await stopWaAgent()
             onStatusChange('disconnected')
-            setPolledQR(null)
             setPolledPairingCode(null)
             setMessage('Agent stopped.')
             onAnalyticsRefresh?.()
@@ -126,11 +129,11 @@ export default function WhatsAppPanel({ waStatus, qrCode: wsQrCode, pairingCode:
                     <div className={`status-dot ${waStatus}`} />
                     <div>
                         <p className="text-white font-medium">
-                            {isConnected ? 'Agent Active' : isPairing ? 'Scanning QR Code' : 'Agent Offline'}
+                            {isConnected ? 'Agent Active' : isPairing ? 'Fetching Pairing Code' : 'Agent Offline'}
                         </p>
                         <p className="text-gray-500 text-xs mt-0.5">
                             {isConnected ? 'Auto-responding to allowed contacts'
-                                : isPairing ? 'Open WhatsApp → Linked Devices → Link a Device'
+                                : isPairing ? 'Open WhatsApp → Linked Devices → Link with phone number'
                                     : 'Click Start Agent below to begin'}
                         </p>
                     </div>
@@ -141,24 +144,16 @@ export default function WhatsAppPanel({ waStatus, qrCode: wsQrCode, pairingCode:
                     {!isConnected && !isPairing && (
                         <>
                             <div className="flex flex-col gap-2">
-                                <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
-                                    <input
-                                        type="checkbox"
-                                        checked={usePairingCode}
-                                        onChange={(e) => setUsePairingCode(e.target.checked)}
-                                        className="rounded border-board-600 bg-board-800 text-board-accent focus:ring-board-accent"
-                                    />
-                                    Link with Phone Number (Pairing Code)
+                                <label className="text-sm text-gray-300 font-medium">
+                                    Link with Phone Number
                                 </label>
-                                {usePairingCode && (
-                                    <input
-                                        type="text"
-                                        placeholder="e.g. 919876543210 (Country code + Number)"
-                                        value={phoneNumber}
-                                        onChange={(e) => setPhoneNumber(e.target.value)}
-                                        className="input bg-board-800 border-board-600 focus:border-board-accent text-sm"
-                                    />
-                                )}
+                                <input
+                                    type="text"
+                                    placeholder="e.g. +917310885365"
+                                    value={phoneNumber}
+                                    onChange={handlePhoneChange}
+                                    className="input bg-board-800 border-board-600 focus:border-board-accent text-sm pb-2 pt-2"
+                                />
                             </div>
                             <div className="flex gap-3 flex-wrap mt-2">
                                 <button onClick={handleStart} disabled={loading} className="btn-accent flex items-center gap-2">
@@ -214,27 +209,12 @@ export default function WhatsAppPanel({ waStatus, qrCode: wsQrCode, pairingCode:
                     </div>
                 )}
 
-                {isPairing && activeQR && !activePairingCode && (
-                    <div className="text-center">
-                        <p className="text-gray-400 text-sm mb-4">
-                            Open WhatsApp → ⋮ Menu → Linked Devices → Link a Device
-                        </p>
-                        <div className="qr-frame mx-auto mb-4 bg-white p-3 rounded-xl">
-                            <QRCodeSVG value={activeQR} size={220} level="M" />
-                        </div>
-                        <div className="flex items-center justify-center gap-2 text-xs text-gray-500 animate-pulse">
-                            <Loader size={12} className="animate-spin" />
-                            Waiting for scan...
-                        </div>
-                    </div>
-                )}
-
-                {isPairing && !activeQR && !activePairingCode && (
+                {isPairing && !activePairingCode && (
                     <div className="text-center text-gray-400">
                         <Loader size={40} className="animate-spin mx-auto mb-4 text-board-accent" />
                         <p className="text-sm font-medium">Initializing WhatsApp session...</p>
                         <p className="text-xs text-gray-600 mt-1">
-                            {usePairingCode ? "Pairing code" : "QR code"} will appear in a few seconds
+                            Pairing code will appear in a few seconds
                         </p>
                     </div>
                 )}
@@ -254,7 +234,7 @@ export default function WhatsAppPanel({ waStatus, qrCode: wsQrCode, pairingCode:
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                     {[
                         { n: '1', t: 'Start Agent', d: 'Initializes your isolated WhatsApp session on the server' },
-                        { n: '2', t: 'Authenticate', d: 'Scan the QR code or use the pairing code to link WhatsApp' },
+                        { n: '2', t: 'Authenticate', d: 'Use the 8-character pairing code to link WhatsApp' },
                         { n: '3', t: 'Pick Contacts', d: 'Go to Contacts → select who the agent can talk to' },
                         { n: '4', t: 'Stay Human', d: 'Agent replies in your style, adapts to each contact\'s energy' },
                     ].map(item => (
