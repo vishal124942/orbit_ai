@@ -4,10 +4,10 @@ import { startWaAgent, stopWaAgent, useAuthStore } from '../lib/api'
 import axios from 'axios'
 
 /**
- * QR Poller — REST polling as the primary QR delivery mechanism.
- * Works even if WebSocket is flaky. Polls /api/whatsapp/qr every 2.5s.
+ * Pairing Code Poller — REST polling as the primary delivery mechanism.
+ * Works even if WebSocket is flaky. Polls /api/whatsapp/pairing-code every 2.5s.
  */
-function useQRPoller(enabled, onPairingCode, onConnected) {
+function usePairingCodePoller(enabled, onPairingCode, onConnected) {
     const timerRef = useRef(null)
 
     useEffect(() => {
@@ -19,7 +19,7 @@ function useQRPoller(enabled, onPairingCode, onConnected) {
         const poll = async () => {
             try {
                 const token = useAuthStore.getState().token
-                const res = await axios.get('/api/whatsapp/qr', {
+                const res = await axios.get('/api/whatsapp/pairing-code', {
                     headers: { Authorization: `Bearer ${token}` },
                     timeout: 5000,
                 })
@@ -46,7 +46,7 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
     // Primary source: REST polling. Secondary: WebSocket push.
     const activePairingCode = polledPairingCode || wsPairingCode
 
-    useQRPoller(
+    usePairingCodePoller(
         waStatus === 'pairing',
         setPolledPairingCode,
         () => { onStatusChange('connected'); onAnalyticsRefresh?.() }
