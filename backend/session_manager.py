@@ -29,7 +29,6 @@ class UserSession:
     data_dir: str
     controller: Optional[object] = None         # AIAgentController instance
     task: Optional[asyncio.Task] = None          # Background agent task
-    qr_code: Optional[str] = None
     pairing_code: Optional[str] = None
     wa_status: str = "disconnected"             # disconnected/pairing/connected
     wa_jid: Optional[str] = None
@@ -125,7 +124,6 @@ class SessionManager:
             user_id=user_id,
             config=config,
             allowed_jids=allowed_jids,
-            on_qr=lambda qr: self._on_qr(user_id, qr),
             on_status=lambda s, jid=None, name=None, number=None: asyncio.create_task(
                 self._on_status(user_id, s, jid, name, number)
             ),
@@ -158,18 +156,6 @@ class SessionManager:
             await self.platform_db.update_wa_status(user_id, "disconnected")
             await self.platform_db.set_agent_running(user_id, False)
 
-    def _on_qr(self, user_id: str, qr: str):
-        """Called when WhatsApp generates a QR code for this user."""
-        session = self.sessions.get(user_id)
-        if session:
-            session.qr_code = qr
-            session.wa_status = "pairing"
-            asyncio.create_task(self._broadcast(user_id, {
-                "type": "qr",
-                "data": qr,
-                "status": "pairing"
-            }))
-
     def _on_pairing_code(self, user_id: str, code: str):
         """Called when WhatsApp generates a pairing code for this user."""
         session = self.sessions.get(user_id)
@@ -190,7 +176,6 @@ class SessionManager:
             session.wa_status = status
             if wa_jid:
                 session.wa_jid = wa_jid
-                session.qr_code = None  # Clear QR once connected
                 session.pairing_code = None
 
         await self.platform_db.update_wa_status(user_id, status, wa_jid, wa_name, wa_number)
@@ -278,14 +263,12 @@ class SessionManager:
             return {
                 "status": db_session["status"] if db_session else "disconnected",
                 "is_running": False,
-                "qr_code": None,
-                "pairing_code": None,
+                "pairing_code": db_session.get("pairing_code") if db_session else None,
                 "wa_jid": db_session.get("wa_jid") if db_session else None,
             }
         return {
             "status": session.wa_status,
             "is_running": session.is_running,
-            "qr_code": session.qr_code,
             "pairing_code": session.pairing_code,
             "wa_jid": session.wa_jid,
         }

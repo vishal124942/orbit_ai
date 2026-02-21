@@ -458,11 +458,7 @@ async function startGateway() {
     });
 
     sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect, qr } = update;
-
-        if (qr) {
-            console.log(JSON.stringify({ type: 'qr', data: qr }));
-        }
+        const { connection, lastDisconnect } = update;
 
         if (connection) {
             console.log(JSON.stringify({
@@ -499,8 +495,8 @@ async function startGateway() {
                     console.error(`[Gateway] Reconnecting in ${delay / 1000}s... (${isConflict ? 'conflict — waiting for competing session to close' : 'normal reconnect'})`);
                     setTimeout(() => startGateway(), delay);
                 } else {
-                    console.error('[Gateway] Logged out (401). Auto-clearing auth and restarting for fresh QR...');
-                    // Clear stale auth files so next start generates a new QR
+                    console.error('[Gateway] Logged out (401). Auto-clearing auth and restarting for fresh session...');
+                    // Clear stale auth files so next start requests fresh session
                     try {
                         const files = fs.readdirSync(AUTH_DIR);
                         for (const file of files) {
@@ -510,7 +506,7 @@ async function startGateway() {
                     } catch (e) {
                         console.error(`[Gateway] Auth cleanup error: ${e.message}`);
                     }
-                    // Restart gateway — will generate fresh QR
+                    // Restart gateway — will request fresh session
                     contacts = {};
                     setTimeout(() => startGateway(), 2000);
                 }

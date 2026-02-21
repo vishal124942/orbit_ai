@@ -15,7 +15,6 @@ class WhatsAppBridge:
         self.process: Optional[subprocess.Popen] = None
         self.event_queue = queue.Queue()
         self.callbacks = {
-            'qr': None,
             'pairing_code': None,
             'connection': None,
             'message': None,

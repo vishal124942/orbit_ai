@@ -34,7 +34,6 @@ class UserAgentController:
         user_id: str,
         config: Dict,
         allowed_jids: Set[str],
-        on_qr: Callable,
         on_status: Callable,
         on_contacts: Callable,
         on_pairing_code: Callable = None,
@@ -42,7 +41,6 @@ class UserAgentController:
         self.user_id = user_id
         self.config = config
         self.allowed_jids = allowed_jids
-        self.on_qr_cb = on_qr
         self.on_status_cb = on_status
         self.on_contacts_cb = on_contacts
         self.on_pairing_code_cb = on_pairing_code
@@ -153,7 +151,6 @@ class UserAgentController:
             update_soul_fn=self.update_contact_soul,
             has_soul_fn=lambda jid: jid in self._contact_souls,
             contact_tones=self._contact_tones,
-            on_qr=self.on_qr_cb,
             on_status=self.on_status_cb,
             on_contacts=self.on_contacts_cb,
             on_pairing_code=self.on_pairing_code_cb,
@@ -199,7 +196,6 @@ class _IsolatedAgentController:
         update_soul_fn: Callable,
         has_soul_fn: Callable,
         contact_tones: Dict,
-        on_qr: Callable,
         on_status: Callable,
         on_contacts: Callable,
         on_pairing_code: Callable,
@@ -230,7 +226,6 @@ class _IsolatedAgentController:
         self.update_soul_fn = update_soul_fn
         self.has_soul_fn = has_soul_fn
         self._contact_tones = contact_tones
-        self.on_qr_cb = on_qr
         self.on_status_cb = on_status
         self.on_contacts_cb = on_contacts
         self.on_pairing_code_cb = on_pairing_code
@@ -281,19 +276,13 @@ class _IsolatedAgentController:
         phone_number = config.get("whatsapp", {}).get("phone_number")
         self.wa_bridge = WhatsAppBridge(auth_dir, phone_number=phone_number, session_id=self.user_id)
         self._setup_wa()
-        self.status = {"whatsapp": "disconnected", "last_qr": None, "pairing_code": None}
+        self.status = {"whatsapp": "disconnected", "pairing_code": None}
 
         from backend.src.core.agent_controller import (
             ORCHESTRATOR_SYSTEM_PROMPT, INTERACTIVE_SYSTEM_PROMPT
         )
         self.ORCHESTRATOR_SYSTEM_PROMPT = ORCHESTRATOR_SYSTEM_PROMPT
         self.INTERACTIVE_SYSTEM_PROMPT = INTERACTIVE_SYSTEM_PROMPT
-
-    def _setup_wa(self):
-        def on_qr(event):
-            self.status["last_qr"] = event["data"]
-            self.status["whatsapp"] = "pairing"
-            self.loop.call_soon_threadsafe(lambda: self.on_qr_cb(event["data"]))
 
         def on_pairing_code(event):
             self.status["pairing_code"] = event["code"]
@@ -489,7 +478,6 @@ class _IsolatedAgentController:
                 if self.loop:
                     asyncio.run_coroutine_threadsafe(_generate_souls_bg(), self.loop)
 
-        self.wa_bridge.on_event("qr", on_qr)
         self.wa_bridge.on_event("connection", on_connection)
         self.wa_bridge.on_event("message", on_message)
         self.wa_bridge.on_event("contacts", on_contacts)

@@ -2,7 +2,7 @@
 Orbit AI — Multi-Tenant FastAPI Backend (v2)
 ===============================================
 - PostgreSQL (asyncpg) for platform data
-- /api/whatsapp/qr polling endpoint (primary QR delivery)
+- /api/whatsapp/pairing-code polling endpoint
 - WebSocket as bonus real-time channel
 - No media file persistence (EphemeralMediaProcessor)
 - Daily maintenance: TTS cache cleanup + media description pruning
@@ -181,19 +181,16 @@ class StartWaRequest(BaseModel):
     phone_number: Optional[str] = None
 
 
-@app.get("/api/whatsapp/qr")
-async def wa_get_qr(user: Dict = Depends(get_current_user)):
+@app.get("/api/whatsapp/pairing-code")
+async def wa_get_pairing_code(user: Dict = Depends(get_current_user)):
     """
-    Primary QR delivery via REST polling.
+    Primary Pairing Code delivery via REST polling.
     Frontend polls this every 2s when status == 'pairing'.
-    No WebSocket required for QR to work.
     """
     status = await session_manager.get_session_status(user["id"])
     return {
         "status": status["status"],
-        "qr_code": status.get("qr_code"),
         "pairing_code": status.get("pairing_code"),
-        "has_qr": bool(status.get("qr_code")),
         "has_pairing_code": bool(status.get("pairing_code")),
     }
 
@@ -206,7 +203,7 @@ async def wa_start(req: StartWaRequest = Body(default=None), user: Dict = Depend
     
     phone_number = req.phone_number if req else None
     await session_manager.start_pairing(user["id"], phone_number=phone_number)
-    return {"message": "Agent starting. Poll /api/whatsapp/qr for QR code or pairing code.", "status": "starting"}
+    return {"message": "Agent starting. Poll /api/whatsapp/pairing-code for pairing code.", "status": "starting"}
 
 
 @app.post("/api/whatsapp/stop")
@@ -497,8 +494,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
     # Send current state immediately
     status = await session_manager.get_session_status(user_id)
     await websocket.send_json({"type": "status", **status})
-    if status.get("qr_code"):
-        await websocket.send_json({"type": "qr", "data": status["qr_code"]})
+    if status.get("pairing_code"):
+        await websocket.send_json({"type": "pairing_code", "data": status["pairing_code"]})
 
     try:
         while True:
