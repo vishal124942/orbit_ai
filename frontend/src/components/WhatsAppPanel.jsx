@@ -62,15 +62,29 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
     const isPairing = waStatus === 'pairing'
     const isDisconnected = waStatus === 'disconnected'
 
-    // Format phone number to only allow + and digits
+    // Format phone number to exactly +91-XXXXXXXXXX
     const handlePhoneChange = (e) => {
         let val = e.target.value;
-        // Strip everything except + and numbers. Ensure + only at start.
-        val = val.replace(/[^\d+]/g, '');
-        if (val.indexOf('+') > 0) {
-            val = val.replace(/\+/g, '');
+        if (!val) {
+            setPhoneNumber('');
+            return;
         }
-        setPhoneNumber(val);
+        // Extract digits only
+        let digits = val.replace(/\D/g, '');
+
+        // Auto-prefix with 91 if the user starts typing an Indian local number (e.g. 7, 8, 9)
+        if (digits.length > 0 && digits.length <= 10 && !digits.startsWith('91')) {
+            digits = '91' + digits;
+        }
+
+        // Format as +CC-XXXXXXXXXX
+        if (digits.length > 2) {
+            setPhoneNumber(`+${digits.substring(0, 2)}-${digits.substring(2, 12)}`);
+        } else if (digits.length > 0) {
+            setPhoneNumber(`+${digits}`);
+        } else {
+            setPhoneNumber('');
+        }
     }
 
     const handleStart = async () => {
