@@ -21,6 +21,7 @@ export default function DashboardPage() {
     const [activeTab, setActiveTab] = useState('whatsapp')
     const [waStatus, setWaStatus] = useState('disconnected')
     const [qrCode, setQrCode] = useState(null)
+    const [pairingCode, setPairingCode] = useState(null)
     const [analytics, setAnalytics] = useState(null)
     const [ws, setWs] = useState(null)
 
@@ -46,11 +47,17 @@ export default function DashboardPage() {
     const handleWsMessage = useCallback((msg) => {
         if (msg.type === 'qr') {
             setQrCode(msg.data)
+            setPairingCode(null)
+            setWaStatus('pairing')
+        } else if (msg.type === 'pairing_code') {
+            setPairingCode(msg.data)
+            setQrCode(null)
             setWaStatus('pairing')
         } else if (msg.type === 'status') {
             setWaStatus(msg.status)
             if (msg.status === 'connected') {
                 setQrCode(null)
+                setPairingCode(null)
                 loadAnalytics()
             }
         } else if (msg.type === 'contacts_synced') {
