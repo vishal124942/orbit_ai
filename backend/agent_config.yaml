@@ -1,0 +1,103 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Orbit AI — Agent Configuration v3.0
+# Full Media I/O + Three-Tier Memory + Two-LLM Stack
+# ─────────────────────────────────────────────────────────────────────────────
+
+agent:
+  name: "Orbit AI"
+  description: "WhatsApp companion — full vibe, full media, three-tier memory"
+  version: "3.0.0"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM-2: Orchestrator / Planner (GPT-4o)
+# ─────────────────────────────────────────────────────────────────────────────
+openai:
+  model: "gpt-4o"
+  temperature: 0.75
+  max_tokens: 2000
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM-1: Indian Analyzer + Localizer (Sarvam-M)
+# Set enabled: false to fall back to GPT-4o for both roles.
+# Requires SARVAM_API_KEY environment variable.
+# ─────────────────────────────────────────────────────────────────────────────
+sarvam:
+  enabled: true
+  model: "sarvam-m"
+  api_base: "https://api.sarvam.ai/v1"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WhatsApp
+# ─────────────────────────────────────────────────────────────────────────────
+whatsapp:
+  enabled: true
+  session_name: "default"
+  auto_respond: true
+  debounce_seconds: 8
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Media Processing
+# ─────────────────────────────────────────────────────────────────────────────
+media:
+  # Number of keyframes to extract from video for vision analysis
+  video_keyframes: 4
+  # Number of frames to extract from animated stickers
+  animated_sticker_frames: 3
+  # Whisper language hint (speeds up transcription when known)
+  whisper_language: "hi"     # "hi" for Hindi/Hinglish, null for auto-detect
+  # Vision detail level: "low" (fast, cheaper) or "high" (precise, costs more)
+  vision_detail: "low"
+  # Max video audio duration to transcribe (seconds — keeps costs sane)
+  video_audio_max_seconds: 120
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TTS (Outbound Voice Notes)
+# ─────────────────────────────────────────────────────────────────────────────
+tts:
+  enabled: true
+  model: "tts-1"           # tts-1 = fast | tts-1-hd = higher quality
+  speed: 1.05              # Slightly faster feels more natural for Indian speech
+  # Max text length to send as audio (longer → forced text)
+  audio_char_limit: 280
+  # Voices per vibe (OpenAI TTS voices: alloy/echo/fable/onyx/nova/shimmer)
+  voices:
+    default: "onyx"
+    fun: "alloy"
+    banter: "fable"
+    roast: "onyx"
+    affectionate: "nova"
+    sad: "shimmer"
+    serious: "echo"
+    flirty: "nova"
+    savage: "fable"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Three-Tier Memory System
+# ─────────────────────────────────────────────────────────────────────────────
+memory:
+  # Short-term: sliding window size (messages kept in RAM per JID)
+  short_term_window: 20
+  # Episodic: run reflection extraction every N messages
+  reflection_every_n: 12
+  # Episodic: max episodes to retrieve and inject per LLM call
+  episode_inject_limit: 5
+  # Episodic: max episodes to store per JID before pruning
+  episode_max_per_jid: 200
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Policy Router — Only real-world-consequence intents trigger handoff
+# Vibe, gaali, toxicity — NONE of these affect routing.
+# ─────────────────────────────────────────────────────────────────────────────
+policy:
+  handoff_intents:
+    - money
+    - emergency
+  draft_intents: []          # Empty = everything auto-replies by default
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dashboard
+# ─────────────────────────────────────────────────────────────────────────────
+dashboard:
+  host: "0.0.0.0"
+  port: 5000
+  secret_key: "default-secret-change-me"

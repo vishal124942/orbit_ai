@@ -1,0 +1,117 @@
+# ----------------------------------------------------------------------
+# Environment Variables & Secrets
+# ----------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+auth.json
+
+# ----------------------------------------------------------------------
+# Application Data & Caches
+# ----------------------------------------------------------------------
+# User data, chat histories, agent memory
+data/
+data/users/
+data/media_cache/
+backend/data/
+*.db
+*.sqlite
+*.sqlite3
+
+# ----------------------------------------------------------------------
+# Python
+# ----------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+.nox/
+.tox/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+venv.bak/
+
+# ----------------------------------------------------------------------
+# Node.js & Frontend (React/Next.js/Vite)
+# ----------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+dist/
+build/
+.next/
+out/
+.nuxt/
+.vuepress/dist
+.serverless/
+.fusebox/
+.dynamodb/
+
+# ----------------------------------------------------------------------
+# WhatsApp Baileys State
+# ----------------------------------------------------------------------
+# If any auth states are kept locally (e.g. auth_info_baileys)
+auth_info_baileys/
+baileys_auth_info/
+brand_*.json
+
+# ----------------------------------------------------------------------
+# macOS & OS Generated Files
+# ----------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ----------------------------------------------------------------------
+# IDEs & Editors
+# ----------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.fleet/
+
+# ----------------------------------------------------------------------
+# Logs & Testing
+# ----------------------------------------------------------------------
+logs/
+*.log
+backend/logs/
+test_voice.*
