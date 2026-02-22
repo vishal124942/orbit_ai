@@ -209,12 +209,13 @@ async def wa_start(req: StartWaRequest = Body(default=None), user: Dict = Depend
         if wa_session and wa_session.get("wa_number"):
             saved_number = wa_session["wa_number"]
             clean_phone = ''.join(filter(str.isdigit, phone_number))
-            clean_saved = ''.join(filter(str.isdigit, saved_number))
+            # Some WA sessions save the number with a device ID suffix like: 917310885365:53
+            clean_saved = ''.join(filter(str.isdigit, saved_number.split(':')[0]))
             
             if clean_phone and clean_saved and clean_phone != clean_saved:
                 raise HTTPException(
                     status_code=400, 
-                    detail=f"Account is already bound to {saved_number}. Please use the same number or create a new Orbit AI account for a different number."
+                    detail=f"Account is already bound to +{clean_saved}. Please use the same number or create a new Orbit AI account for a different number."
                 )
 
     await session_manager.start_pairing(user["id"], phone_number=phone_number)
