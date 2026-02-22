@@ -385,7 +385,7 @@ async function startGateway() {
         },
         logger,
         // MUST use these specific browser options for Pairing Code to work
-        browser: phoneNumber ? ["Ubuntu", "Chrome", "20.0.04"] : ["Orbit AI", "Desktop", "1.0.0"],
+        browser: phoneNumber ? ["Mac OS", "Chrome", "121.0.0.0"] : ["Orbit AI", "Desktop", "1.0.0"],
         connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: 60000,
         keepAliveIntervalMs: 30000,
@@ -555,7 +555,8 @@ async function startGateway() {
                     }
                     // Restart gateway — will request fresh session
                     contacts = {};
-                    setTimeout(() => startGateway(), 2000);
+                    console.error('[Gateway] Throttling for 10 seconds to prevent WhatsApp API spam ban...');
+                    setTimeout(() => startGateway(), 10000);
                 }
             }
         }
