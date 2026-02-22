@@ -202,6 +202,21 @@ async def wa_start(req: StartWaRequest = Body(default=None), user: Dict = Depend
         return {"message": "Agent already running", **status}
     
     phone_number = req.phone_number if req else None
+    
+    # Enforce 1 Account = 1 Phone Rule
+    if phone_number:
+        wa_session = await platform_db.get_wa_session(user["id"])
+        if wa_session and wa_session.get("wa_number"):
+            saved_number = wa_session["wa_number"]
+            clean_phone = ''.join(filter(str.isdigit, phone_number))
+            clean_saved = ''.join(filter(str.isdigit, saved_number))
+            
+            if clean_phone and clean_saved and clean_phone != clean_saved:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Account is already bound to {saved_number}. Please use the same number or create a new Orbit AI account for a different number."
+                )
+
     await session_manager.start_pairing(user["id"], phone_number=phone_number)
     return {"message": "Agent starting. Poll /api/whatsapp/pairing-code for pairing code.", "status": "starting"}
 
