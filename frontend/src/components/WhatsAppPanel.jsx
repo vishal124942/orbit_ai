@@ -23,17 +23,29 @@ function usePairingCodePoller(enabled, onPairingCode, onConnected) {
                     headers: { Authorization: `Bearer ${token}` },
                     timeout: 5000,
                 })
-                if (res.data.has_pairing_code) onPairingCode(res.data.pairing_code)
-                if (res.data.status === 'connected') {
+
+                if (res.data.has_pairing_code) {
+                    onPairingCode(res.data.pairing_code)
+                    // Once we have the code, stop hammering the backend
+                    if (timerRef.current) {
+                        clearInterval(timerRef.current)
+                        timerRef.current = null
+                    }
+                } else if (res.data.status === 'connected') {
                     onConnected()
-                    clearInterval(timerRef.current)
+                    if (timerRef.current) {
+                        clearInterval(timerRef.current)
+                        timerRef.current = null
+                    }
                 }
             } catch (_) { }
         }
 
         poll()
         timerRef.current = setInterval(poll, 2500)
-        return () => clearInterval(timerRef.current)
+        return () => {
+            if (timerRef.current) clearInterval(timerRef.current)
+        }
     }, [enabled])
 }
 
