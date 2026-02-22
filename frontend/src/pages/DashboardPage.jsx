@@ -1,8 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-    LogOut, RefreshCw, Bot, Zap, Users,
-    ChevronRight, Activity
+    LogOut, Bot, Zap, Users, Activity
 } from 'lucide-react'
 import { useAuthStore, fetchMe, getAnalytics, createWebSocket, startWaAgent } from '../lib/api'
 import WhatsAppPanel from '../components/WhatsAppPanel'

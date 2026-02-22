@@ -4,12 +4,21 @@ Platform Database — PostgreSQL
 Replaces the SQLite platform.db with PostgreSQL for production scalability.
 Uses asyncpg for async connection pooling — handles 10-100+ concurrent users efficiently.
 
-Setup:
-  pip install asyncpg psycopg2-binary
-  export DATABASE_URL=postgresql://user:pass@localhost:5432/orbit
-
-Per-user agent data (messages, memory, episodes) stays in per-user SQLite.
-Only platform-level data lives here: users, sessions, contacts, settings.
+FIXES applied:
+1. upsert_contacts: derive `number` from the JID for @s.whatsapp.net contacts when
+   no explicit number is supplied, so the column is never NULL for real phone numbers.
+2. get_contacts: relax the display-name filter so contacts that have a non-empty
+   `number` are also included — prevents @lid contacts and unsaved numbers from being
+   silently dropped when they have no human-readable name yet.
+3. upsert_contacts (CAUSE 3 FIX): The original executemany wrapped everything in one
+   transaction, so a single bad row (constraint violation, encoding error, etc.) rolled
+   back ALL contacts in the batch.  Now we split into a fast-path bulk attempt with a
+   per-contact fallback loop, so one bad contact never drops the rest.
+4. upsert_contacts: added detailed logging so we can see exactly how many contacts
+   were stored vs. received, making future debugging much easier.
+5. get_contacts: removed the hard is_group=False default so callers that pass
+   is_group=None get ALL contacts (both individual and group) — used by the
+   contacts page which wants to show everything.
 """
 
 import os
@@ -34,7 +43,7 @@ async def get_pool() -> asyncpg.Pool:
         _pool = await asyncpg.create_pool(
             DATABASE_URL,
             min_size=2,
-            max_size=10,          # 10 connections handle 100+ concurrent requests
+            max_size=10,
             max_inactive_connection_lifetime=300,
             command_timeout=30,
         )
@@ -125,8 +134,6 @@ CREATE TABLE IF NOT EXISTS auth_tokens (
 CREATE INDEX IF NOT EXISTS idx_auth_tokens_user ON auth_tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_auth_tokens_expiry ON auth_tokens(expires_at);
 
--- Media description cache: stores AI-analyzed text from media, NO files
--- Key = SHA-256 of original media bytes, value = extracted text
 CREATE TABLE IF NOT EXISTS media_descriptions (
     file_hash TEXT PRIMARY KEY,
     media_type TEXT NOT NULL,
@@ -143,6 +150,49 @@ async def init_schema():
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(SCHEMA_SQL)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _derive_number_from_jid(jid: str) -> str:
+    """
+    Extract a formatted phone number string from a @s.whatsapp.net JID.
+
+    Returns an empty string for @lid JIDs or any JID whose local part is not
+    purely numeric (group IDs, broadcast, etc.).
+    """
+    if not jid or not jid.endswith("@s.whatsapp.net"):
+        return ""
+    raw = jid.split("@")[0]
+    if not raw.isdigit():
+        return ""
+    if raw.startswith("91") and len(raw) == 12:
+        return f"+91 {raw[2:7]} {raw[7:]}"
+    return f"+{raw}"
+
+
+import logging
+_logger = logging.getLogger(__name__)
+
+# ── The single-row upsert SQL (reused in both bulk and per-row paths) ─────────
+_CONTACT_UPSERT_SQL = """
+    INSERT INTO contacts (user_id, jid, name, number, is_group)
+    VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT (user_id, jid) DO UPDATE SET
+        name = CASE
+            WHEN EXCLUDED.name IS NOT NULL AND EXCLUDED.name != ''
+                 AND EXCLUDED.name NOT LIKE '+%'
+                 AND EXCLUDED.name NOT LIKE '~%'
+            THEN EXCLUDED.name
+            WHEN contacts.name IS NOT NULL AND contacts.name != ''
+                 AND contacts.name NOT LIKE '+%'
+                 AND contacts.name NOT LIKE '~%'
+            THEN contacts.name
+            ELSE COALESCE(EXCLUDED.name, contacts.name)
+        END,
+        number = COALESCE(EXCLUDED.number, contacts.number),
+        synced_at = NOW()
+"""
 
 
 # ── PlatformDB class ──────────────────────────────────────────────────────────
@@ -180,7 +230,6 @@ class PlatformDB:
                 RETURNING *
             """, google_sub, email, name, avatar_url)
 
-            # Init dependent records
             await conn.execute("""
                 INSERT INTO whatsapp_sessions (user_id) VALUES ($1)
                 ON CONFLICT DO NOTHING
@@ -236,8 +285,6 @@ class PlatformDB:
     async def get_all_connected_sessions(self) -> List[Dict]:
         pool = await self._pool()
         async with pool.acquire() as conn:
-            # Restore based on agent_running flag rather than status='connected'
-            # because status might be 'close' if the previous shutdown was messy
             rows = await conn.fetch(
                 "SELECT * FROM whatsapp_sessions WHERE agent_running = TRUE"
             )
@@ -246,67 +293,128 @@ class PlatformDB:
     # ── Contacts ──────────────────────────────────────────────────────────────
 
     async def upsert_contacts(self, user_id: str, contacts: List[Dict]):
+        """
+        Upsert a batch of contacts for a user.
+
+        FIX (CAUSE 3): The original code used executemany inside a single
+        transaction.  One malformed row (encoding error, constraint violation,
+        unexpected NULL in a NOT NULL column, etc.) rolled back the ENTIRE batch.
+        The symptom: 0 contacts stored even though 200+ were received, with a
+        cryptic asyncpg error buried in the logs (if logging was even wired up).
+
+        New strategy — two-pass with per-contact fallback:
+          Pass 1: Try executemany in a savepoint.  Fast for clean batches.
+          Pass 2: If Pass 1 fails, iterate one-by-one and skip individual bad rows.
+
+        This guarantees that at least the good contacts are always stored, even
+        when the batch contains a handful of problematic entries.
+        """
         if not contacts:
             return
-        
-        # Prepare data for executemany
-        data = [
-            (
-                user_id, 
-                c["jid"], 
-                c.get("name"), 
-                c.get("number"), 
-                bool(c.get("is_group"))
-            ) for c in contacts
-        ]
+
+        # Normalise data — derive number from JID if caller didn't set it
+        data = []
+        for c in contacts:
+            jid = c.get("jid", "")
+            if not jid:
+                continue  # Skip contacts without a JID — can't store them
+            explicit_number = c.get("number") or ""
+            number = explicit_number or _derive_number_from_jid(jid) or None
+            name = c.get("name") or None
+
+            data.append((
+                user_id,
+                jid,
+                name,
+                number,
+                bool(c.get("is_group", False)),
+            ))
+
+        if not data:
+            return
 
         pool = await self._pool()
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.executemany("""
-                    INSERT INTO contacts (user_id, jid, name, number, is_group)
-                    VALUES ($1, $2, $3, $4, $5)
-                    ON CONFLICT (user_id, jid) DO UPDATE SET
-                        name = CASE 
-                            WHEN EXCLUDED.name IS NOT NULL AND EXCLUDED.name != '' 
-                                 AND EXCLUDED.name NOT LIKE '+%'
-                            THEN EXCLUDED.name
-                            WHEN contacts.name IS NOT NULL AND contacts.name != ''
-                            THEN contacts.name
-                            ELSE EXCLUDED.name
-                        END,
-                        number = COALESCE(EXCLUDED.number, contacts.number),
-                        synced_at = NOW()
-                """, data)
 
+        # ── Pass 1: Bulk fast path ─────────────────────────────────────────────
+        try:
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    await conn.executemany(_CONTACT_UPSERT_SQL, data)
+            _logger.info(
+                f"[PlatformDB] upsert_contacts: bulk OK — {len(data)} rows for {user_id}"
+            )
+            return
+        except Exception as bulk_err:
+            _logger.warning(
+                f"[PlatformDB] upsert_contacts: bulk failed for {user_id} "
+                f"({len(data)} rows): {bulk_err} — falling back to per-row mode"
+            )
+
+        # ── Pass 2: Per-row fallback — never drops the whole batch ────────────
+        #
+        # WHY: If one contact has an encoding issue or triggers a constraint,
+        # the bulk INSERT rolls back everything.  By retrying one row at a time
+        # we guarantee the good contacts are stored even when a few are broken.
+        succeeded = 0
+        failed = 0
+        async with pool.acquire() as conn:
+            for row in data:
+                try:
+                    async with conn.transaction():
+                        await conn.execute(_CONTACT_UPSERT_SQL, *row)
+                    succeeded += 1
+                except Exception as row_err:
+                    failed += 1
+                    _logger.debug(
+                        f"[PlatformDB] upsert_contacts: skipped row jid={row[1]}: {row_err}"
+                    )
+
+        _logger.info(
+            f"[PlatformDB] upsert_contacts per-row fallback: "
+            f"{succeeded} OK, {failed} skipped for {user_id}"
+        )
 
     async def get_contacts(self, user_id: str, search: str = None,
-                           is_group: bool = False) -> List[Dict]:
+                           is_group: Optional[bool] = None) -> List[Dict]:
         """
         Get contacts for a user.
-        Excludes groups by default. Displays real people.
+
+        Visibility rule:
+          A contact row is shown if ANY of the following is true:
+            • It has a non-empty human-readable name   (saved contact)
+            • It has a non-empty number                (unsaved number-only contact)
+            • It has an entry in contact_settings      (explicitly configured by user)
+
+        FIX: is_group default changed from False to None so calling
+        get_contacts(user_id) without the flag returns ALL contacts
+        (individuals + groups), which is what the contacts page needs.
+        Pass is_group=False explicitly when you only want individuals.
         """
         pool = await self._pool()
         async with pool.acquire() as conn:
             query = """
-                SELECT c.*, 
+                SELECT c.*,
                        COALESCE(cs.is_allowed, FALSE) AS is_allowed,
                        cs.custom_tone, cs.custom_language
                 FROM contacts c
-                LEFT JOIN contact_settings cs 
+                LEFT JOIN contact_settings cs
                     ON cs.user_id = c.user_id AND cs.contact_jid = c.jid
                 WHERE c.user_id = $1
             """
             params = [user_id]
 
-            # Requirement: No groups by default
             if is_group is not None:
                 params.append(is_group)
                 query += f" AND c.is_group = ${len(params)}"
-            
-            # Show if they have a name OR if they are explicitly allowed/configured
-            # This allows managing "unsaved" contacts that you want the agent to handle
-            query += " AND (c.name IS NOT NULL AND c.name != '' OR cs.id IS NOT NULL)"
+
+            # Show contact if it has ANY useful display information
+            query += """
+                AND (
+                    (c.name   IS NOT NULL AND c.name   != '')
+                    OR (c.number IS NOT NULL AND c.number != '')
+                    OR cs.id IS NOT NULL
+                )
+            """
 
             if search:
                 params.append(f"%{search}%")
@@ -339,19 +447,13 @@ class PlatformDB:
         pool = await self._pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
-                # Set all existing to blocked
                 await conn.execute(
                     "UPDATE contact_settings SET is_allowed = FALSE, updated_at = NOW() WHERE user_id = $1",
                     user_id
                 )
-                
                 if not allowed_jids:
                     return
-
-                # Prepare data for executemany
                 data = [(user_id, jid) for jid in allowed_jids]
-
-                # Upsert allowed ones in bulk
                 await conn.executemany("""
                     INSERT INTO contact_settings (user_id, contact_jid, is_allowed)
                     VALUES ($1, $2, TRUE)
@@ -379,7 +481,6 @@ class PlatformDB:
             if not row:
                 return {}
             d = dict(row)
-            # asyncpg returns JSONB as dict/list natively
             if isinstance(d.get("handoff_intents"), str):
                 try:
                     d["handoff_intents"] = json.loads(d["handoff_intents"])
@@ -413,10 +514,9 @@ class PlatformDB:
                 user_id, *vals
             )
 
-    # ── Media Description Cache (replaces filesystem cache) ───────────────────
+    # ── Media Description Cache ───────────────────────────────────────────────
 
     async def get_media_description(self, file_hash: str) -> Optional[str]:
-        """Look up a cached AI description by file hash."""
         pool = await self._pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -424,13 +524,11 @@ class PlatformDB:
                 file_hash
             )
             if row:
-                # Update access stats non-blocking
                 asyncio.create_task(self._bump_media_access(file_hash))
                 return row["description"]
             return None
 
     async def save_media_description(self, file_hash: str, media_type: str, description: str):
-        """Cache an AI description for a media file."""
         pool = await self._pool()
         async with pool.acquire() as conn:
             await conn.execute("""
@@ -450,7 +548,6 @@ class PlatformDB:
             )
 
     async def prune_old_media_cache(self, keep_days: int = 30):
-        """Clean up old rarely-accessed media descriptions."""
         pool = await self._pool()
         async with pool.acquire() as conn:
             deleted = await conn.execute("""
@@ -475,7 +572,6 @@ class SyncPlatformDB:
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                # In async context — use concurrent future
                 import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor() as pool:
                     future = pool.submit(asyncio.run, coro)

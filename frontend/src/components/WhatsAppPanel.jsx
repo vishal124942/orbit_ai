@@ -5,10 +5,24 @@ import axios from 'axios'
 
 /**
  * Pairing Code Poller — REST polling as the primary delivery mechanism.
- * Works even if WebSocket is flaky. Polls /api/whatsapp/pairing-code every 2.5s.
+ *
+ * FIXES:
+ * 1. Stale closure: onPairingCode and onConnected were missing from the
+ *    useEffect dependency array.  If the parent re-rendered and passed new
+ *    function references, the poller kept using the old (stale) callbacks.
+ *    Fixed by using useRef wrappers (stableOnPairingCode / stableOnConnected)
+ *    so the effect only re-mounts on enabled/hasActiveCode changes while
+ *    always invoking the latest callback version.
  */
 function usePairingCodePoller(enabled, hasActiveCode, onPairingCode, onConnected) {
     const timerRef = useRef(null)
+
+    // Stable refs so the interval callback always calls the latest version
+    // of onPairingCode / onConnected without needing them in the dep array
+    const onPairingCodeRef = useRef(onPairingCode)
+    const onConnectedRef = useRef(onConnected)
+    useEffect(() => { onPairingCodeRef.current = onPairingCode }, [onPairingCode])
+    useEffect(() => { onConnectedRef.current = onConnected }, [onConnected])
 
     useEffect(() => {
         if (!enabled || hasActiveCode) {
@@ -28,67 +42,82 @@ function usePairingCodePoller(enabled, hasActiveCode, onPairingCode, onConnected
                 })
 
                 if (res.data.has_pairing_code) {
-                    onPairingCode(res.data.pairing_code)
+                    onPairingCodeRef.current(res.data.pairing_code)
                     if (timerRef.current) {
                         clearInterval(timerRef.current)
                         timerRef.current = null
                     }
                 } else if (res.data.status === 'connected') {
-                    onConnected()
+                    onConnectedRef.current()
                     if (timerRef.current) {
                         clearInterval(timerRef.current)
                         timerRef.current = null
                     }
                 }
-            } catch (_) { }
+            } catch (_) { /* network hiccup — retry on next tick */ }
         }
 
         poll()
         timerRef.current = setInterval(poll, 2500)
         return () => {
-            if (timerRef.current) clearInterval(timerRef.current)
+            if (timerRef.current) {
+                clearInterval(timerRef.current)
+                timerRef.current = null
+            }
         }
-    }, [enabled, hasActiveCode])
+    }, [enabled, hasActiveCode]) // stable refs mean we DON'T need callbacks here
 }
 
-export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, onStatusChange, onClearPairingCode, onAnalyticsRefresh }) {
+export default function WhatsAppPanel({
+    waStatus,
+    pairingCode: wsPairingCode,
+    onStatusChange,
+    onClearPairingCode,
+    onAnalyticsRefresh,
+}) {
+    // FIX: Track loading as state (triggers re-render) AND as a ref (synchronous gate).
+    // Using only a ref for the disabled prop is wrong — refs don't trigger re-renders,
+    // so the button would appear enabled visually even while a request is in flight.
+    // The ref is the authoritative lock; the state drives the visual.
     const [loading, setLoading] = useState(false)
     const [message, setMessage] = useState('')
     const [polledPairingCode, setPolledPairingCode] = useState(null)
     const [phoneNumber, setPhoneNumber] = useState('')
 
-    // ── FIX: Single in-flight guard ─────────────────────────────────────────
-    // Prevents two API calls from racing each other when the user double-clicks
-    // or when the polling interval fires exactly as an action button is clicked.
-    // Using a ref (not state) so it's synchronous and doesn't cause re-renders.
     const requestInFlight = useRef(false)
 
-    /** Wraps any async API action with the in-flight lock. */
+    /**
+     * Wrap any async API action with the in-flight lock.
+     * Sets both the ref (synchronous lock) and loading state (visual feedback)
+     * so the button is correctly disabled in all cases.
+     */
     const withLock = useCallback(async (fn) => {
         if (requestInFlight.current) {
             console.warn('[WhatsAppPanel] Request already in flight — ignoring duplicate')
             return
         }
         requestInFlight.current = true
-        setLoading(true)
+        setLoading(true)      // ← triggers re-render → button becomes disabled visually
         setMessage('')
         try {
             await fn()
         } finally {
             requestInFlight.current = false
-            setLoading(false)
+            setLoading(false) // ← triggers re-render → button becomes enabled again
         }
     }, [])
-    // ────────────────────────────────────────────────────────────────────────
 
-    // Primary source: REST polling. Secondary: WebSocket push.
+    // Primary: REST poll. Secondary: WebSocket push (wsPairingCode).
     const activePairingCode = polledPairingCode || wsPairingCode
 
     usePairingCodePoller(
         waStatus === 'pairing',
         !!activePairingCode,
         setPolledPairingCode,
-        () => { onStatusChange('connected'); onAnalyticsRefresh?.() }
+        () => {
+            onStatusChange('connected')
+            onAnalyticsRefresh?.()
+        },
     )
 
     useEffect(() => {
@@ -99,38 +128,34 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
 
     const isConnected = waStatus === 'connected'
     const isPairing = waStatus === 'pairing'
+    const isRegenerating = waStatus === 'regenerating'
     const isDisconnected = waStatus === 'disconnected'
 
     const handlePhoneChange = (e) => {
-        let val = e.target.value;
-        if (!val) {
-            setPhoneNumber('');
-            return;
-        }
-        let digits = val.replace(/\D/g, '');
-
+        const val = e.target.value
+        if (!val) { setPhoneNumber(''); return }
+        let digits = val.replace(/\D/g, '')
         if (digits.length > 0 && digits.length <= 10 && !digits.startsWith('91')) {
-            digits = '91' + digits;
+            digits = '91' + digits
         }
-
         if (digits.length > 2) {
-            setPhoneNumber(`+${digits.substring(0, 2)}-${digits.substring(2, 12)}`);
+            setPhoneNumber(`+${digits.substring(0, 2)}-${digits.substring(2, 12)}`)
         } else if (digits.length > 0) {
-            setPhoneNumber(`+${digits}`);
+            setPhoneNumber(`+${digits}`)
         } else {
-            setPhoneNumber('');
+            setPhoneNumber('')
         }
     }
 
     const handleStart = () => withLock(async () => {
         if (!phoneNumber.trim() || phoneNumber.replace(/\D/g, '').length < 10) {
-            setMessage('Please enter a valid phone number with your country code (e.g. +917310885365).')
+            setMessage('Please enter a valid phone number with country code (e.g. +917310885365).')
             return
         }
         try {
             await startWaAgent(phoneNumber.trim())
             onStatusChange('pairing')
-            setMessage('Starting... Pairing code will appear shortly.')
+            setMessage('Starting… Pairing code will appear shortly.')
         } catch (e) {
             setMessage(e.response?.data?.detail || 'Failed to start agent')
         }
@@ -151,18 +176,21 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
     const handleRegenerate = () => withLock(async () => {
         setPolledPairingCode(null)
         onClearPairingCode?.()
-        // Temporarily shift status off 'pairing' to pause the poller and
-        // prevent it from fetching the dying session's stale code.
+        // Shift status off 'pairing' so the poller stops fetching the dying session's code
         onStatusChange('regenerating')
         try {
             await regenerateWaCode(phoneNumber)
             onStatusChange('pairing')
-            setMessage('Generating fresh pairing code...')
+            setMessage('Generating fresh pairing code…')
         } catch (e) {
             onStatusChange('pairing') // Revert on failure
             setMessage(e.response?.data?.detail || 'Failed to regenerate code')
         }
     })
+
+    // Buttons should be disabled while loading OR while the lock is held
+    // (loading state drives re-renders, so disabled will always reflect the true state)
+    const isLocked = loading
 
     return (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -173,24 +201,33 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
                         <h2 className="font-display text-xl text-white">WhatsApp Agent</h2>
                         <p className="text-gray-500 text-sm mt-1">Connect your number to activate</p>
                     </div>
-                    <div className={`p-3 rounded-xl ${isConnected ? 'bg-green-500/10' : isPairing ? 'bg-board-accent/10' : 'bg-board-700'
+                    <div className={`p-3 rounded-xl ${isConnected ? 'bg-green-500/10'
+                        : (isPairing || isRegenerating) ? 'bg-board-accent/10'
+                            : 'bg-board-700'
                         }`}>
                         <Smartphone size={24} className={
-                            isConnected ? 'text-board-green' : isPairing ? 'text-board-accent' : 'text-gray-500'
+                            isConnected ? 'text-board-green'
+                                : (isPairing || isRegenerating) ? 'text-board-accent'
+                                    : 'text-gray-500'
                         } />
                     </div>
                 </div>
 
                 {/* Status pill */}
                 <div className="flex items-center gap-3 p-4 rounded-xl bg-board-700 mb-6">
-                    <div className={`status-dot ${waStatus}`} />
+                    <div className={`status-dot ${isRegenerating ? 'pairing' : waStatus}`} />
                     <div>
                         <p className="text-white font-medium">
-                            {isConnected ? 'Agent Active' : isPairing ? 'Fetching Pairing Code' : 'Agent Offline'}
+                            {isConnected ? 'Agent Active'
+                                : isPairing ? 'Fetching Pairing Code'
+                                    : isRegenerating ? 'Regenerating Code…'
+                                        : 'Agent Offline'}
                         </p>
                         <p className="text-gray-500 text-xs mt-0.5">
-                            {isConnected ? 'Auto-responding to allowed contacts'
-                                : isPairing ? 'Open WhatsApp → Linked Devices → Link with phone number'
+                            {isConnected
+                                ? 'Auto-responding to allowed contacts'
+                                : (isPairing || isRegenerating)
+                                    ? 'Open WhatsApp → Linked Devices → Link with phone number'
                                     : 'Click Start Agent below to begin'}
                         </p>
                     </div>
@@ -198,7 +235,7 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
 
                 {/* Actions */}
                 <div className="flex flex-col gap-4">
-                    {!isConnected && !isPairing && (
+                    {!isConnected && !isPairing && !isRegenerating && (
                         <>
                             <div className="flex flex-col gap-2">
                                 <label className="text-sm text-gray-300 font-medium">
@@ -215,23 +252,27 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
                             <div className="flex gap-3 flex-wrap mt-2">
                                 <button
                                     onClick={handleStart}
-                                    disabled={loading || requestInFlight.current}
-                                    className="btn-accent flex items-center gap-2"
+                                    disabled={isLocked}
+                                    className="btn-accent flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                                 >
-                                    {loading ? <Loader size={16} className="animate-spin" /> : <Play size={16} />}
+                                    {isLocked
+                                        ? <Loader size={16} className="animate-spin" />
+                                        : <Play size={16} />}
                                     Start Agent
                                 </button>
                             </div>
                         </>
                     )}
-                    {(isConnected || isPairing) && (
+                    {(isConnected || isPairing || isRegenerating) && (
                         <div className="flex gap-3 flex-wrap">
                             <button
                                 onClick={handleStop}
-                                disabled={loading || requestInFlight.current}
-                                className="btn-ghost flex items-center gap-2"
+                                disabled={isLocked}
+                                className="btn-ghost flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                             >
-                                {loading ? <Loader size={16} className="animate-spin" /> : <Square size={16} />}
+                                {isLocked
+                                    ? <Loader size={16} className="animate-spin" />
+                                    : <Square size={16} />}
                                 Stop Agent
                             </button>
                         </div>
@@ -241,7 +282,7 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
                 {message && <p className="mt-3 text-sm text-board-accent/80">{message}</p>}
             </div>
 
-            {/* QR / Connected display */}
+            {/* Right panel */}
             <div className="card flex flex-col items-center justify-center min-h-72">
                 {isConnected && (
                     <div className="text-center">
@@ -269,25 +310,38 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
                         </div>
                         <div className="flex items-center justify-center gap-2 text-xs text-gray-500 animate-pulse">
                             <Loader size={12} className="animate-spin" />
-                            Waiting for you to enter code...
+                            Waiting for you to enter code…
                         </div>
                         <div className="mt-6 flex justify-center border-t border-board-600/50 pt-4">
                             <button
                                 onClick={handleRegenerate}
-                                disabled={loading || requestInFlight.current}
+                                disabled={isLocked}
                                 className="text-xs text-board-accent hover:underline flex items-center gap-1 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                             >
-                                {loading ? <Loader size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+                                {isLocked
+                                    ? <Loader size={12} className="animate-spin" />
+                                    : <RefreshCw size={12} />}
                                 Code expired or failed? Generate a new one
                             </button>
                         </div>
                     </div>
                 )}
 
-                {isPairing && !activePairingCode && (
+                {/* FIX: Show regenerating state explicitly — old code had no UI for this */}
+                {isRegenerating && (
+                    <div className="text-center text-gray-400">
+                        <RefreshCw size={40} className="animate-spin mx-auto mb-4 text-board-accent" />
+                        <p className="text-sm font-medium">Generating fresh code…</p>
+                        <p className="text-xs text-gray-600 mt-1">
+                            Stopping old session and requesting a new pairing code
+                        </p>
+                    </div>
+                )}
+
+                {isPairing && !activePairingCode && !isRegenerating && (
                     <div className="text-center text-gray-400">
                         <Loader size={40} className="animate-spin mx-auto mb-4 text-board-accent" />
-                        <p className="text-sm font-medium">Initializing WhatsApp session...</p>
+                        <p className="text-sm font-medium">Initializing WhatsApp session…</p>
                         <p className="text-xs text-gray-600 mt-1">
                             Pairing code will appear in a few seconds
                         </p>
@@ -311,7 +365,7 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
                         { n: '1', t: 'Start Agent', d: 'Initializes your isolated WhatsApp session on the server' },
                         { n: '2', t: 'Authenticate', d: 'Use the 8-character pairing code to link WhatsApp' },
                         { n: '3', t: 'Pick Contacts', d: 'Go to Contacts → select who the agent can talk to' },
-                        { n: '4', t: 'Stay Human', d: 'Agent replies in your style, adapts to each contact\'s energy' },
+                        { n: '4', t: 'Stay Human', d: "Agent replies in your style, adapts to each contact's energy" },
                     ].map(item => (
                         <div key={item.n} className="flex gap-3">
                             <div className="w-7 h-7 rounded-full bg-board-accent/20 border border-board-accent/30 flex items-center justify-center flex-shrink-0 mt-0.5">
