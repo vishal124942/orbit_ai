@@ -79,14 +79,14 @@ class WhatsAppBridge:
 
     def stop(self):
         """Stop the gateway process"""
+        self.is_running = False
         if self.process:
             try:
                 self.process.terminate()
-                self.process.wait(timeout=5)
+                self.process.wait(timeout=2)
             except:
                 self.process.kill()
             finally:
-                self.is_running = False
                 print("🛑 WhatsApp Gateway stopped")
 
     def send_message(self, to: str, text: str, media: Optional[str] = None, media_type: Optional[str] = None):
@@ -228,9 +228,12 @@ class WhatsAppBridge:
     def _health_monitor(self):
         """Monitor gateway health and restart if needed"""
         while self.is_running:
-            time.sleep(30)  # Check every 30 seconds
+            for _ in range(30):
+                if not self.is_running:
+                    return
+                time.sleep(1)
             
-            if self.process and self.process.poll() is not None:
+            if self.is_running and self.process and self.process.poll() is not None:
                 # Process died
                 print("❌ Gateway process died unexpectedly")
                 self.is_running = False

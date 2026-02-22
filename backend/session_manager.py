@@ -35,6 +35,7 @@ class UserSession:
     allowed_jids: Set[str] = field(default_factory=set)
     ws_clients: List = field(default_factory=list)  # WebSocket connections for this user
     is_running: bool = False
+    action_lock: Optional[asyncio.Lock] = None
 
 
 class SessionManager:
@@ -101,51 +102,55 @@ class SessionManager:
                 session = UserSession(user_id=user_id, data_dir=data_dir)
                 # Load current allowlist
                 session.allowed_jids = set(await self.platform_db.get_allowed_jids(user_id))
+                session.action_lock = asyncio.Lock()
                 self.sessions[user_id] = session
+            elif getattr(self.sessions[user_id], 'action_lock', None) is None:
+                self.sessions[user_id].action_lock = asyncio.Lock()
             return self.sessions[user_id]
 
     async def start_pairing(self, user_id: str, phone_number: str = None) -> UserSession:
         """Initialize WhatsApp pairing for a user."""
         session = await self.get_or_create_session(user_id)
 
-        if session.wa_status == "connected" and session.is_running:
+        async with session.action_lock:
+            if session.wa_status == "connected" and session.is_running:
+                return session
+
+            # Kill any existing zombie or stuck process before spawning a new one
+            if session.task or session.controller:
+                logger.info(f"Stopping existing agent process for {user_id} before starting new pairing")
+                await self._stop_agent_internal(user_id, session)
+                await asyncio.sleep(1)
+
+            # Import here to avoid circular deps
+            from backend.user_agent import UserAgentController
+
+            config = await self.get_user_config(user_id)
+            if phone_number:
+                config["whatsapp"]["phone_number"] = phone_number
+
+            allowed_jids = set(await self.platform_db.get_allowed_jids(user_id))
+
+            controller = UserAgentController(
+                user_id=user_id,
+                config=config,
+                allowed_jids=allowed_jids,
+                on_status=lambda s, jid=None, name=None, number=None: asyncio.create_task(
+                    self._on_status(user_id, s, jid, name, number)
+                ),
+                on_contacts=lambda contacts: asyncio.create_task(self._on_contacts(user_id, contacts)),
+                on_pairing_code=lambda code: self._on_pairing_code(user_id, code),
+            )
+
+            session.controller = controller
+            session.wa_status = "pairing"
+            await self.platform_db.update_wa_status(user_id, "pairing")
+
+            # Start controller in background
+            session.task = asyncio.create_task(self._run_controller(user_id, controller))
+            session.is_running = True
+
             return session
-
-        # Kill any existing zombie or stuck process before spawning a new one
-        if session.task or session.controller:
-            logger.info(f"Stopping existing agent process for {user_id} before starting new pairing")
-            await self.stop_agent(user_id)
-            await asyncio.sleep(1)
-
-        # Import here to avoid circular deps
-        from backend.user_agent import UserAgentController
-
-        config = await self.get_user_config(user_id)
-        if phone_number:
-            config["whatsapp"]["phone_number"] = phone_number
-
-        allowed_jids = set(await self.platform_db.get_allowed_jids(user_id))
-
-        controller = UserAgentController(
-            user_id=user_id,
-            config=config,
-            allowed_jids=allowed_jids,
-            on_status=lambda s, jid=None, name=None, number=None: asyncio.create_task(
-                self._on_status(user_id, s, jid, name, number)
-            ),
-            on_contacts=lambda contacts: asyncio.create_task(self._on_contacts(user_id, contacts)),
-            on_pairing_code=lambda code: self._on_pairing_code(user_id, code),
-        )
-
-        session.controller = controller
-        session.wa_status = "pairing"
-        await self.platform_db.update_wa_status(user_id, "pairing")
-
-        # Start controller in background
-        session.task = asyncio.create_task(self._run_controller(user_id, controller))
-        session.is_running = True
-
-        return session
 
     async def _run_controller(self, user_id: str, controller):
         """Run the user's agent controller as a background task."""
@@ -208,6 +213,15 @@ class SessionManager:
         session = self.sessions.get(user_id)
         if not session:
             return
+            
+        if getattr(session, 'action_lock', None) is None:
+            session.action_lock = asyncio.Lock()
+            
+        async with session.action_lock:
+            await self._stop_agent_internal(user_id, session)
+
+    async def _stop_agent_internal(self, user_id: str, session: UserSession):
+        """Internal lock-free shutdown routine."""
 
         if session.task and not session.task.done():
             session.task.cancel()
