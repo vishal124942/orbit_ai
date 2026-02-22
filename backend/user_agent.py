@@ -2,17 +2,17 @@
 UserAgentController
 ====================
 
-FIXES applied:
-1. _sync_contacts: duplicate except clause removed
-2. pause_file creation: open(...).close() resource leak → pathlib.Path.touch()
-3. asyncio.get_event_loop() in background coroutine → asyncio.get_running_loop()
-4. on_history_messages: run_coroutine_threadsafe uses captured loop, not retrieved loop
-5. on_contacts: @lid contacts get a display label so they survive the PG name-filter
-6. on_history_messages (CAUSE 4 FIX): extracts unique sender JIDs from history messages
-   and emits them as stub contacts via on_contacts_cb.  This is the 4th contact
-   source (after contacts.upsert, contacts.update, messaging-history.set explicit
-   contacts) and catches everyone who has ever sent you a message but whose JID
-   was never included in the server's contacts.upsert event.
+CHANGES in v3.1:
+1. Contacts are emitted in chunks of 50 so the frontend gets live updates
+   rather than waiting for one giant batch at the end.
+2. _emitted_history_jids is a module-level set per controller instance so it
+   persists across multiple on_history_messages calls in the same session.
+3. on_contacts: deduplication via seen_jids set before calling on_contacts_cb,
+   preventing duplicate DB writes when the gateway emits overlapping batches.
+4. contact_sync_progress events from the gateway are forwarded as live WS
+   broadcasts so the frontend can display a running counter.
+5. asyncio.get_running_loop() used everywhere — no get_event_loop() calls.
+6. on_agent_control: pathlib.Path.touch() for pause file (no resource leak).
 """
 
 import os
@@ -25,6 +25,9 @@ from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
+# Chunk size for streaming contacts to the frontend
+CONTACT_CHUNK_SIZE = 50
+
 
 class UserAgentController:
     def __init__(
@@ -35,6 +38,7 @@ class UserAgentController:
         on_status: Callable,
         on_contacts: Callable,
         on_pairing_code: Callable = None,
+        on_contact_sync_progress: Callable = None,
     ):
         self.user_id = user_id
         self.config = config
@@ -42,6 +46,7 @@ class UserAgentController:
         self.on_status_cb = on_status
         self.on_contacts_cb = on_contacts
         self.on_pairing_code_cb = on_pairing_code
+        self.on_contact_sync_progress_cb = on_contact_sync_progress  # optional live-count callback
 
         self.data_dir = config["_data_dir"]
         self.soul_override = config.get("_soul_override", "")
@@ -56,9 +61,7 @@ class UserAgentController:
 
     def _load_contact_souls(self):
         souls_dir = os.path.join(self.data_dir, "souls")
-        if not os.path.exists(souls_dir):
-            os.makedirs(souls_dir, exist_ok=True)
-            return
+        os.makedirs(souls_dir, exist_ok=True)
         for fname in os.listdir(souls_dir):
             if fname.endswith(".md"):
                 jid = fname[:-3].replace("_", "@")
@@ -112,8 +115,6 @@ class UserAgentController:
         db_path = os.path.join(self.data_dir, "agent.db")
 
         from backend.src.core.database import Database
-        from backend.src.core.agent_controller import AIAgentController
-
         db = Database(db_path=db_path)
         config = dict(self.config)
 
@@ -130,11 +131,11 @@ class UserAgentController:
             on_status=self.on_status_cb,
             on_contacts=self.on_contacts_cb,
             on_pairing_code=self.on_pairing_code_cb,
+            on_contact_sync_progress=self.on_contact_sync_progress_cb,
             loop=self._loop,
         )
 
         self._controller = controller
-
         logger.info(f"[UserAgent:{self.user_id}] Starting agent...")
         await controller.run_headless()
 
@@ -168,19 +169,18 @@ class _IsolatedAgentController:
         on_status: Callable,
         on_contacts: Callable,
         on_pairing_code: Callable,
+        on_contact_sync_progress: Callable,
         loop: asyncio.AbstractEventLoop,
     ):
         import os
         import json
-        import time
         import asyncio
-        import hashlib
         from openai import OpenAI
         from rich.console import Console
 
         from backend.src.whatsapp.bridge import WhatsAppBridge
         from backend.src.core.indian_analyzer import IndianAnalyzer
-        from backend.src.core.policy_router import PolicyRouter, ROUTE_AUTO_REPLY, ROUTE_DRAFT_FOR_HUMAN, ROUTE_HANDOFF
+        from backend.src.core.policy_router import PolicyRouter
         from backend.src.core.indian_localizer import IndianLocalizer
         from backend.src.core.media_processor import MediaProcessor
         from backend.src.core.media_responder import MediaResponder
@@ -198,6 +198,7 @@ class _IsolatedAgentController:
         self.on_status_cb = on_status
         self.on_contacts_cb = on_contacts
         self.on_pairing_code_cb = on_pairing_code
+        self.on_contact_sync_progress_cb = on_contact_sync_progress
         self.console = Console()
         self.loop = loop
 
@@ -256,10 +257,18 @@ class _IsolatedAgentController:
     def _setup_wa(self):
         loop = self.loop
 
+        # ── Session-level deduplication set for contacts ────────────────────
+        # Tracks which JIDs have already been emitted to avoid duplicate DB writes
+        # when the gateway re-emits overlapping contact batches.
+        _seen_jids: Set[str] = set()
+        # Tracks JIDs emitted specifically from history messages (cause-4 fix)
+        _emitted_history_jids: Set[str] = set()
+
         def on_pairing_code(event):
             self.status["pairing_code"] = event["code"]
             self.status["whatsapp"] = "pairing"
-            loop.call_soon_threadsafe(lambda: self.on_pairing_code_cb(event["code"]))
+            if self.on_pairing_code_cb:
+                loop.call_soon_threadsafe(lambda: self.on_pairing_code_cb(event["code"]))
 
         def on_connection(event):
             status = event["status"]
@@ -289,13 +298,44 @@ class _IsolatedAgentController:
                     lambda: asyncio.create_task(self._handle_inbound_event(event))
                 )
 
+        def _format_contact(c: dict) -> Optional[dict]:
+            """
+            Normalise a single raw contact dict from the gateway.
+            Returns None if the JID is unusable.
+            """
+            jid = c.get("id") or c.get("jid", "")
+            if not jid:
+                return None
+            is_individual = jid.endswith("@s.whatsapp.net") or jid.endswith("@lid")
+            if not is_individual:
+                return None
+
+            name = c.get("name") or c.get("notify") or c.get("pushName")
+            raw_id = jid.split("@")[0] if "@" in jid else jid
+            display_number = ""
+
+            if jid.endswith("@s.whatsapp.net") and raw_id.isdigit():
+                if raw_id.startswith("91") and len(raw_id) == 12:
+                    display_number = f"+91 {raw_id[2:7]} {raw_id[7:]}"
+                else:
+                    display_number = f"+{raw_id}"
+            elif jid.endswith("@lid"):
+                lid_id = c.get("lidId") or raw_id
+                display_number = f"~{lid_id}" if lid_id else f"~{raw_id}"
+
+            final_name = name or display_number or jid
+
+            return {
+                "jid": jid,
+                "name": final_name,
+                "number": display_number,
+                "is_group": False,
+            }
+
         def on_contacts(event):
             """
-            FIX 5: Robust contact normalisation — no contact left behind.
-
-            For @s.whatsapp.net: format E.164 number as display fallback.
-            For @lid: use gateway-provided lidId as synthetic display label.
-            Final name is always non-empty so PG filter never drops the row.
+            Receive contacts from gateway, deduplicate, emit in chunks of 50
+            for streaming updates to the frontend.
             """
             raw_contacts = event.get("data", [])
             logger.info(f"[UserAgent:{self.user_id}] Received {len(raw_contacts)} raw contacts")
@@ -303,37 +343,29 @@ class _IsolatedAgentController:
             formatted = []
             for c in raw_contacts:
                 jid = c.get("id") or c.get("jid", "")
-                if not jid:
+                if not jid or jid in _seen_jids:
                     continue
-                is_individual = jid.endswith("@s.whatsapp.net") or jid.endswith("@lid")
-                if not is_individual:
-                    continue
+                result = _format_contact(c)
+                if result:
+                    formatted.append(result)
+                    _seen_jids.add(jid)
 
-                name = c.get("name") or c.get("notify") or c.get("pushName")
-                raw_id = jid.split("@")[0] if "@" in jid else jid
-                display_number = ""
+            if not formatted:
+                logger.debug(f"[UserAgent:{self.user_id}] No new contacts after dedup")
+                return
 
-                if jid.endswith("@s.whatsapp.net") and raw_id.isdigit():
-                    if raw_id.startswith("91") and len(raw_id) == 12:
-                        display_number = f"+91 {raw_id[2:7]} {raw_id[7:]}"
-                    else:
-                        display_number = f"+{raw_id}"
-                elif jid.endswith("@lid"):
-                    lid_id = c.get("lidId") or raw_id
-                    display_number = f"~{lid_id}" if lid_id else f"~{raw_id}"
+            logger.info(f"[UserAgent:{self.user_id}] {len(formatted)} new contacts after dedup (total seen: {len(_seen_jids)})")
 
-                # Never leave name as None/"" — PG filter will drop the row.
-                final_name = name or display_number or jid
+            # Emit in chunks so the frontend gets progressive updates
+            for i in range(0, len(formatted), CONTACT_CHUNK_SIZE):
+                chunk = formatted[i:i + CONTACT_CHUNK_SIZE]
+                loop.call_soon_threadsafe(lambda ch=chunk: self.on_contacts_cb(ch))
 
-                formatted.append({
-                    "jid": jid,
-                    "name": final_name,
-                    "number": display_number,
-                    "is_group": False,
-                })
-
-            logger.info(f"[UserAgent:{self.user_id}] Passing {len(formatted)} contacts to platform")
-            loop.call_soon_threadsafe(lambda: self.on_contacts_cb(formatted))
+        def on_contact_sync_progress(event):
+            """Forward gateway's running count to the platform as a WS broadcast."""
+            count = event.get("count", 0)
+            if self.on_contact_sync_progress_cb:
+                loop.call_soon_threadsafe(lambda: self.on_contact_sync_progress_cb(count))
 
         def on_agent_control(event):
             cmd = event.get("command", "").lower()
@@ -351,54 +383,32 @@ class _IsolatedAgentController:
         history_buffer: Dict[str, list] = {}
         profiled_jids: set = set()
 
-        # ── FIX (CAUSE 4): Track which JIDs we've already emitted as contacts ──
-        # so repeated history_messages events don't re-send the same stubs.
-        _emitted_history_jids: set = set()
-
         def on_history_messages(event):
             """
-            FIX (CAUSE 4): Extract unique sender JIDs from history messages and
-            emit them as stub contacts via on_contacts_cb.
-
-            WHY THIS IS THE 4TH CONTACT SOURCE:
-              contacts.upsert  → server address book (limited to recent ~30-50 chats)
-              contacts.update  → name/notify updates
-              history.contacts → explicit contact list from history sync payload
-              ← HERE → history message senders → everyone who ever messaged you
-
-            By collecting all unique remoteJid values from history_messages we
-            capture the full set of real people the user has had conversations
-            with, even if WhatsApp never included them in the contacts.upsert
-            event for this linked device session.
-
-            DEDUPLICATION: We track which JIDs have already been emitted this
-            session so repeated history batches don't cause duplicate DB writes.
+            Save history to DB and emit new contact stubs from message senders.
+            Deduplication via _emitted_history_jids prevents repeat DB writes.
             """
             messages = event.get("data", [])
             if not messages:
                 return
 
-            # Collect new JIDs not yet emitted as contacts
+            # Collect new sender JIDs not yet emitted
             new_contact_stubs = []
-            seen_in_batch: set = set()
+            seen_in_batch: Set[str] = set()
 
             for m in messages:
                 remote_jid = m.get("from", "")
                 if not remote_jid:
                     continue
-                # Skip groups, broadcasts, already-emitted
                 if remote_jid.endswith("@g.us") or "broadcast" in remote_jid:
                     continue
                 if not (remote_jid.endswith("@s.whatsapp.net") or remote_jid.endswith("@lid")):
                     continue
-                if remote_jid in _emitted_history_jids:
-                    continue
-                if remote_jid in seen_in_batch:
+                if remote_jid in _emitted_history_jids or remote_jid in seen_in_batch:
                     continue
 
                 seen_in_batch.add(remote_jid)
 
-                # Build display info
                 raw_id = remote_jid.split("@")[0]
                 display_number = ""
                 if remote_jid.endswith("@s.whatsapp.net") and raw_id.isdigit():
@@ -419,16 +429,19 @@ class _IsolatedAgentController:
                     "is_group": False,
                 })
                 _emitted_history_jids.add(remote_jid)
+                _seen_jids.add(remote_jid)  # also deduplicate against on_contacts
 
             if new_contact_stubs:
                 logger.info(
-                    f"[UserAgent:{self.user_id}] history_messages: emitting "
-                    f"{len(new_contact_stubs)} new contact stubs from message senders"
+                    f"[UserAgent:{self.user_id}] history_messages: "
+                    f"{len(new_contact_stubs)} new contact stubs from senders"
                 )
-                # Use call_soon_threadsafe because this runs on the bridge thread
-                loop.call_soon_threadsafe(lambda stubs=new_contact_stubs: self.on_contacts_cb(stubs))
+                # Emit in chunks for streaming
+                for i in range(0, len(new_contact_stubs), CONTACT_CHUNK_SIZE):
+                    chunk = new_contact_stubs[i:i + CONTACT_CHUNK_SIZE]
+                    loop.call_soon_threadsafe(lambda ch=chunk: self.on_contacts_cb(ch))
 
-            # ── Save messages to DB and build history buffer for soul gen ──────
+            # ── Save messages to DB ──────────────────────────────────────────
             for m in messages:
                 remote_jid = m.get("from", "")
                 text = m.get("text", "")
@@ -460,6 +473,7 @@ class _IsolatedAgentController:
                         "content": text,
                     })
 
+            # ── Auto-generate souls for contacts with enough history ──────────
             MIN_MESSAGES = 5
             to_profile = [
                 jid for jid, msgs in history_buffer.items()
@@ -515,14 +529,9 @@ class _IsolatedAgentController:
                             self.update_soul_fn(jid, soul)
                             profiled_jids.add(jid)
                             history_buffer.pop(jid, None)
-                            logger.info(
-                                f"[UserAgent:{self.user_id}] 🧠 Auto-profiled {jid} "
-                                f"({len(msgs)} msgs)"
-                            )
+                            logger.info(f"[UserAgent:{self.user_id}] 🧠 Auto-profiled {jid} ({len(msgs)} msgs)")
                         except Exception as e:
-                            logger.debug(
-                                f"[UserAgent:{self.user_id}] Auto-profile failed for {jid}: {e}"
-                            )
+                            logger.debug(f"[UserAgent:{self.user_id}] Auto-profile failed for {jid}: {e}")
 
                 asyncio.run_coroutine_threadsafe(_generate_souls_bg(), loop)
 
@@ -530,6 +539,7 @@ class _IsolatedAgentController:
         self.wa_bridge.on_event("connection", on_connection)
         self.wa_bridge.on_event("message", on_message)
         self.wa_bridge.on_event("contacts", on_contacts)
+        self.wa_bridge.on_event("contact_sync_progress", on_contact_sync_progress)
         self.wa_bridge.on_event("history_messages", on_history_messages)
         self.wa_bridge.on_event("agent_control", on_agent_control)
 
@@ -606,17 +616,15 @@ class _IsolatedAgentController:
 
         if event.get("mediaPath") and inbound_media_type != "sticker":
             import threading
-            def delayed_cleanup(path):
+            def delayed_cleanup(p):
                 import time
                 time.sleep(10)
                 try:
-                    if os.path.exists(path):
-                        os.remove(path)
+                    if os.path.exists(p):
+                        os.remove(p)
                 except Exception:
                     pass
-            threading.Thread(
-                target=delayed_cleanup, args=(event["mediaPath"],), daemon=True
-            ).start()
+            threading.Thread(target=delayed_cleanup, args=(event["mediaPath"],), daemon=True).start()
 
         session = self._get_session(remote_jid)
         session["last_message_id"] = event.get("id")
@@ -692,7 +700,6 @@ class _IsolatedAgentController:
             logger.error(f"[UserAgent:{self.user_id}] Soul refresh failed: {e}")
 
     async def _process_auto_respond(self, remote_jid: str):
-        import time
         from backend.src.core.policy_router import ROUTE_AUTO_REPLY, ROUTE_HANDOFF, ROUTE_DRAFT_FOR_HUMAN
 
         async with self._get_response_lock(remote_jid):
@@ -704,12 +711,10 @@ class _IsolatedAgentController:
                 return
 
             session = self._get_session(remote_jid)
-            if "msg_count_since_profile" not in session:
-                session["msg_count_since_profile"] = 0
+            session.setdefault("msg_count_since_profile", 0)
             session["msg_count_since_profile"] += len(batch)
 
             if session["msg_count_since_profile"] >= 30:
-                logger.info(f"[UserAgent:{self.user_id}] 🧠 Triggering soul refresh for {remote_jid}")
                 session["msg_count_since_profile"] = 0
                 asyncio.create_task(self._background_soul_refresh(remote_jid))
 
@@ -722,15 +727,11 @@ class _IsolatedAgentController:
 
             if is_emergency or is_money:
                 reason = "Emergency" if is_emergency else "Payment/Money"
-                logger.info(f"[Handoff] {reason} detected from {remote_jid}")
                 feedback = ("I've seen your message. I'll get back to you immediately."
                             if is_emergency else
                             "Wait a bit, I'll get back to you shortly.")
                 await self._send_text(remote_jid, feedback)
-                self.db.log_analysis(
-                    remote_jid, {"vibe": "serious", "intent": reason},
-                    "HANDOFF", f"Detected {reason} keywords", len(batch)
-                )
+                self.db.log_analysis(remote_jid, {"vibe": "serious", "intent": reason}, "HANDOFF", f"Detected {reason} keywords", len(batch))
                 return
 
             inbound_media_type = batch[-1].get("mediaType")
@@ -758,9 +759,7 @@ class _IsolatedAgentController:
                 self.db.log_analysis(remote_jid, analysis, route, route_reason, len(batch))
 
                 if route == ROUTE_HANDOFF:
-                    handoff_msg = self.config.get("agent", {}).get(
-                        "support_contact", "Thik hai bhai, operator se contact karo."
-                    )
+                    handoff_msg = self.config.get("agent", {}).get("support_contact", "Thik hai bhai, operator se contact karo.")
                     await self._send_text(remote_jid, handoff_msg)
                     return
 
@@ -774,9 +773,7 @@ class _IsolatedAgentController:
                     return
 
                 reply_text = plan.get("reply_text", "")
-                response_type = self.media_responder.recommend_response_type(
-                    analysis, plan, inbound_media_type
-                )
+                response_type = self.media_responder.recommend_response_type(analysis, plan, inbound_media_type)
 
                 await self._execute_plan(
                     remote_jid=remote_jid,
@@ -794,7 +791,6 @@ class _IsolatedAgentController:
                 logger.error(f"[UserAgent:{self.user_id}] Pipeline error for {remote_jid}: {e}", exc_info=True)
 
     async def _run_orchestrator(self, remote_jid: str, analysis: Dict, current_text: str) -> Optional[Dict]:
-        import json
         session = self._get_session(remote_jid)
         history = session["history"]
         memory_ctx = self.memory.build_memory_context(remote_jid, current_text)
@@ -867,9 +863,7 @@ class _IsolatedAgentController:
             if response_type == "audio":
                 audio_path = await self.media_responder.generate_voice_note(localized_reply, vibe)
                 if audio_path:
-                    self.wa_bridge.send_message(
-                        to=remote_jid, text="", media=audio_path, media_type="audio"
-                    )
+                    self.wa_bridge.send_message(to=remote_jid, text="", media=audio_path, media_type="audio")
                     self.db.add_message(remote_jid=remote_jid, text="[Voice]", from_me=1, media_type="audio")
                 else:
                     await self._send_text(remote_jid, localized_reply)
@@ -899,9 +893,7 @@ class _IsolatedAgentController:
         try:
             stickers = self.sticker_analyzer.search_stickers(vibe=vibe)
             if stickers:
-                self.wa_bridge.send_message(
-                    to=jid, text="", media=stickers[0]["path"], media_type="sticker"
-                )
+                self.wa_bridge.send_message(to=jid, text="", media=stickers[0]["path"], media_type="sticker")
                 return True
         except Exception:
             pass

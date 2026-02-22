@@ -1,23 +1,19 @@
 """
-Multi-User Session Manager
-===========================
+Multi-User Session Manager — v3.1
+===================================
 
-FIXES applied:
-1. _stop_agent_internal: subprocess.run was blocking the asyncio event loop
-   for up to 30 s.  Replaced with asyncio.create_subprocess_exec + wait().
-2. _run_controller: session.controller was not cleared on exception, leaving
-   a stale ref that caused the next start() to skip cleanup incorrectly.
-3. Deadlock in wa_regenerate flow: stop_agent acquires action_lock, then
-   start_pairing tried to acquire the same lock — deadlock.  Separated the
-   lock scope so stop and start are sequential but not nested.
-4. restore_active_sessions: wraps each session restore individually so one
-   failure doesn't abort all others.
-5. _on_contacts: was called with zero error handling — a single asyncpg
-   exception silently dropped ALL contacts with no log entry.  Now wrapped
-   in try/except with per-batch logging.  Broadcasts contacts_synced even
-   when upsert partially succeeds so the frontend stays in sync.
-6. _on_contacts: now called via asyncio.create_task so a slow DB write never
-   blocks the stdout reader thread (which would stall incoming events).
+CHANGES in v3.1:
+1. start_pairing: passes on_contact_sync_progress callback to UserAgentController
+   so the gateway's live count events propagate all the way to the frontend WS.
+2. _on_contact_sync_progress: new handler that broadcasts a contacts_progress WS
+   event (type, count) to all connected WebSocket clients in real time.
+3. _on_contacts: per-contact-batch logging improved; task is created so the
+   DB write never blocks the bridge stdout reader.
+4. _stop_agent_internal: asyncio.create_subprocess_exec + wait() so the R2
+   clear-state call never blocks the event loop (was subprocess.run before).
+5. restore_active_sessions: per-session error isolation preserved.
+6. Deadlock fix retained: stop_agent and start_pairing acquire action_lock
+   independently so wa_regenerate callers never nest locks.
 """
 
 import os
@@ -42,6 +38,7 @@ class UserSession:
     ws_clients: List = field(default_factory=list)
     is_running: bool = False
     action_lock: Optional[asyncio.Lock] = None
+    contact_sync_count: int = 0   # running tally of synced contacts
 
 
 class SessionManager:
@@ -49,7 +46,7 @@ class SessionManager:
         self.platform_db = platform_db
         self.base_config = base_config
         self.sessions: Dict[str, UserSession] = {}
-        self._lock = asyncio.Lock()  # Protects self.sessions dict
+        self._lock = asyncio.Lock()
 
     # ── Directories ───────────────────────────────────────────────────────────
 
@@ -110,11 +107,9 @@ class SessionManager:
         """
         Initialize WhatsApp pairing.
 
-        FIX (deadlock): The original code held action_lock across the entire
-        stop + start sequence.  wa_regenerate calls stop_agent (which acquires
-        action_lock) and then start_pairing (which tried to acquire it again) —
-        deadlock.  Now start_pairing only acquires the lock for its own work;
-        callers that need stop+start must sequence them without nesting locks.
+        Deadlock-safe: acquires action_lock only for its own scope.
+        Callers doing stop+start (wa_regenerate) must call them sequentially
+        without nesting, as each acquires the lock independently.
         """
         session = await self.get_or_create_session(user_id)
 
@@ -122,7 +117,6 @@ class SessionManager:
             if session.wa_status == "connected" and session.is_running:
                 return session
 
-            # Tear down any existing process before spawning a new one
             if session.task or session.controller:
                 logger.info(f"[SessionManager] Stopping existing agent for {user_id} before re-pairing")
                 await self._stop_agent_internal(user_id, session)
@@ -135,6 +129,7 @@ class SessionManager:
                 config["whatsapp"]["phone_number"] = phone_number
 
             allowed_jids = set(await self.platform_db.get_allowed_jids(user_id))
+            session.contact_sync_count = 0  # Reset counter on new pairing
 
             controller = UserAgentController(
                 user_id=user_id,
@@ -147,6 +142,7 @@ class SessionManager:
                     self._on_contacts(user_id, contacts)
                 ),
                 on_pairing_code=lambda code: self._on_pairing_code(user_id, code),
+                on_contact_sync_progress=lambda count: self._on_contact_sync_progress(user_id, count),
             )
 
             session.controller = controller
@@ -166,8 +162,7 @@ class SessionManager:
         except Exception as e:
             logger.error(f"[SessionManager] Agent error for {user_id}: {e}", exc_info=True)
         finally:
-            # FIX: Always clean up session state, whether we exited normally
-            # or crashed — prevents stale controller ref on next start.
+            # Always clean up — prevents stale controller ref on next start
             session = self.sessions.get(user_id)
             if session:
                 session.is_running = False
@@ -197,7 +192,7 @@ class SessionManager:
             session.wa_status = status
             if wa_jid:
                 session.wa_jid = wa_jid
-                session.pairing_code = None  # Code consumed — clear it
+                session.pairing_code = None
 
         await self.platform_db.update_wa_status(user_id, status, wa_jid, wa_name, wa_number)
         if status == "connected":
@@ -212,20 +207,13 @@ class SessionManager:
 
     async def _on_contacts(self, user_id: str, contacts: List[Dict]):
         """
-        FIX (CAUSE 2 — silent failure): The original code had zero error handling.
-        A single asyncpg exception (connection blip, constraint violation, etc.)
-        caused ALL contacts in the batch to be silently dropped with no log entry,
-        no retry, and no feedback to the frontend.
+        Store a batch of contacts and broadcast sync progress to the frontend.
 
-        Now:
-        1. The entire upsert is wrapped in try/except with detailed logging.
-        2. We broadcast contacts_synced regardless — even if DB write fails,
-           the in-memory session state stays consistent.
-        3. The batch size is logged so we can tell at a glance whether the
-           gateway is sending a reasonable number of contacts.
+        Uses two-pass upsert (bulk + per-row fallback) in pg_models, so one
+        bad row never drops the whole batch.  Broadcasts contacts_synced after
+        every batch so the frontend counter stays accurate in real time.
         """
         if not contacts:
-            logger.warning(f"[SessionManager] _on_contacts called with empty list for {user_id}")
             return
 
         logger.info(f"[SessionManager] Storing {len(contacts)} contacts for {user_id}")
@@ -237,28 +225,48 @@ class SessionManager:
         except Exception as e:
             logger.error(
                 f"[SessionManager] ❌ upsert_contacts failed for {user_id} "
-                f"(batch size={len(contacts)}): {e}",
+                f"(batch={len(contacts)}): {e}",
                 exc_info=True,
             )
-            # Don't re-raise — we still want to broadcast so the frontend
-            # knows a sync was attempted, and the 5-min periodic re-flush
-            # in the gateway will retry automatically.
+
+        # Update running tally on session
+        session = self.sessions.get(user_id)
+        if session:
+            session.contact_sync_count += stored_count
 
         asyncio.create_task(self._broadcast(user_id, {
             "type": "contacts_synced",
             "count": stored_count,
             "received": len(contacts),
+            "total_synced": session.contact_sync_count if session else stored_count,
+        }))
+
+    def _on_contact_sync_progress(self, user_id: str, count: int):
+        """
+        Receive live contact count from the gateway and broadcast it immediately
+        to all WebSocket clients so the frontend can show a running counter.
+
+        This is called from the bridge thread via call_soon_threadsafe — it must
+        only schedule work on the event loop, never do async I/O directly.
+        """
+        session = self.sessions.get(user_id)
+        if session:
+            session.contact_sync_count = max(session.contact_sync_count, count)
+
+        # Fire-and-forget broadcast — doesn't block the bridge thread
+        asyncio.create_task(self._broadcast(user_id, {
+            "type": "contacts_progress",
+            "count": count,
         }))
 
     # ── Stop ──────────────────────────────────────────────────────────────────
 
     async def stop_agent(self, user_id: str):
         """
-        Stop a user's agent.
+        Stop a user's agent. Acquires action_lock independently.
 
-        FIX (deadlock): This acquires action_lock independently.  Callers that
-        need stop + start (e.g. wa_regenerate) must call stop_agent(), await it,
-        then call start_pairing() — never nesting them under a shared lock.
+        Callers doing stop+start (wa_regenerate) must call this first, await it,
+        then call start_pairing — never nesting the two under a shared lock.
         """
         session = self.sessions.get(user_id)
         if not session:
@@ -281,7 +289,7 @@ class SessionManager:
                 pass
         session.task = None
 
-        # 2. Stop the bridge (synchronous but fast — just sends SIGTERM)
+        # 2. Stop the bridge (fast — just sends SIGTERM to the Node subprocess)
         if session.controller:
             try:
                 await session.controller.stop()
@@ -299,7 +307,7 @@ class SessionManager:
         except Exception as e:
             logger.error(f"[SessionManager] Failed to wipe local auth dir: {e}")
 
-        # 4. Wipe Cloudflare R2 session (non-blocking)
+        # 4. Wipe Cloudflare R2 session — non-blocking async subprocess
         try:
             gateway_script = os.path.join(
                 os.getcwd(), "backend", "src", "whatsapp", "gateway_v3.js"
@@ -326,6 +334,7 @@ class SessionManager:
         session.wa_status = "disconnected"
         session.pairing_code = None
         session.wa_jid = None
+        session.contact_sync_count = 0
 
         await self.platform_db.set_agent_running(user_id, False)
         await self.platform_db.update_wa_status(user_id, "disconnected")
@@ -376,20 +385,20 @@ class SessionManager:
                 "is_running": False,
                 "pairing_code": db_session.get("pairing_code") if db_session else None,
                 "wa_jid": db_session.get("wa_jid") if db_session else None,
+                "contact_sync_count": 0,
             }
         return {
             "status": session.wa_status,
             "is_running": session.is_running,
             "pairing_code": session.pairing_code,
             "wa_jid": session.wa_jid,
+            "contact_sync_count": session.contact_sync_count,
         }
 
     async def restore_active_sessions(self):
         """
         On startup: restore agents for users that were previously connected.
-
-        FIX: Each session is restored independently so one failure doesn't
-        abort all others.
+        Each session is isolated so one failure doesn't abort others.
         """
         try:
             active = await self.platform_db.get_all_connected_sessions()
@@ -402,6 +411,4 @@ class SessionManager:
                 logger.info(f"[SessionManager] Restoring session for {s['user_id']}")
                 await self.start_pairing(s["user_id"])
             except Exception as e:
-                logger.error(
-                    f"[SessionManager] Failed to restore session for {s['user_id']}: {e}"
-                )
+                logger.error(f"[SessionManager] Failed to restore session for {s['user_id']}: {e}")

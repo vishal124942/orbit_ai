@@ -1,11 +1,14 @@
 """
-Orbit AI — Multi-Tenant FastAPI Backend
+Orbit AI — Multi-Tenant FastAPI Backend v3.1
 
-FIXES applied:
-1. Removed duplicate imports (PlatformDB, SessionManager, auth fns were imported twice)
-2. Removed 'import asyncio' inside wa_regenerate (already module-level import)
-3. wa_regenerate: stop_agent + start_pairing are now sequenced without nested locks
-4. get_top_contacts: opens separate sqlite3 connection safely inside try/finally
+CHANGES in v3.1:
+1. /api/contacts/sync-status — new endpoint returning live contact count,
+   recently-synced count, and running in-memory tally from the session.
+2. WebSocket: forwards contacts_progress events (gateway live count) to
+   frontend clients so the counter updates in real time without polling.
+3. wa_regenerate: stop + start remain sequenced without nested locks.
+4. get_top_contacts: sqlite3 connection safely opened inside try/finally.
+5. Removed duplicate imports.
 """
 
 import os
@@ -24,7 +27,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-# ── Application dependencies (single import block) ────────────────────────────
 from backend.pg_models import PlatformDB, init_schema, close_pool
 from backend.session_manager import SessionManager
 from backend.auth import (
@@ -61,7 +63,7 @@ async def lifespan(app: FastAPI):
     session_manager = SessionManager(platform_db, base_config)
     await session_manager.restore_active_sessions()
     asyncio.create_task(_maintenance_loop())
-    logger.info("🚀 Orbit AI Backend ready")
+    logger.info("🚀 Orbit AI Backend v3.1 ready")
     yield
     await close_pool()
 
@@ -167,10 +169,13 @@ async def get_me(user: Dict = Depends(get_current_user)):
     wa = await platform_db.get_wa_session(user["id"]) or {}
     settings = await platform_db.get_agent_settings(user["id"]) or {}
 
-    # Check if agent is remotely paused
     data_dir = os.path.expanduser(f'~/.ai-agent-system/data/users/{user["id"]}')
     pause_file = os.path.join(data_dir, "paused.lock")
     is_paused = os.path.exists(pause_file)
+
+    # Include live contact sync count from in-memory session
+    session = session_manager.sessions.get(user["id"])
+    contact_sync_count = session.contact_sync_count if session else 0
 
     return {
         "user": user,
@@ -181,6 +186,7 @@ async def get_me(user: Dict = Depends(get_current_user)):
             "wa_number": wa.get("wa_number"),
             "agent_running": bool(wa.get("agent_running", False)) and not is_paused,
             "is_paused": is_paused,
+            "contact_sync_count": contact_sync_count,
         },
         "settings": settings,
     }
@@ -214,7 +220,7 @@ async def wa_start(
 
     phone_number = req.phone_number if req else None
 
-    # Enforce 1 Account = 1 Phone Rule
+    # Enforce 1 Account = 1 Phone
     if phone_number:
         wa_session = await platform_db.get_wa_session(user["id"])
         if wa_session and wa_session.get("wa_number"):
@@ -249,17 +255,11 @@ async def wa_regenerate(
     user: Dict = Depends(get_current_user),
 ):
     """
-    Stop current pairing session and spin up a fresh one for a new code.
-
-    FIX (deadlock): The original code called stop_agent() then start_pairing()
-    where stop_agent acquires action_lock and start_pairing tried to acquire it
-    again — deadlock on the same coroutine.  Now they are called sequentially as
-    independent lock acquisitions (each lock scope completes before the next).
-    Also removed the 'import asyncio' inside the function — it was already imported
-    at module level.
+    Stop current session and start fresh for a new pairing code.
+    stop_agent and start_pairing each acquire action_lock independently —
+    no nesting means no deadlock.
     """
     wa_session = await platform_db.get_wa_session(user["id"])
-
     phone_number = (
         (req.phone_number if req and req.phone_number else None)
         or (wa_session.get("wa_number") if wa_session else None)
@@ -271,16 +271,10 @@ async def wa_regenerate(
             detail="No phone number provided or bound to this account.",
         )
 
-    # Strip multi-device suffix (e.g. 917310885365:53 → +917310885365)
     clean_phone = '+' + ''.join(filter(str.isdigit, phone_number.split(':')[0]))
 
-    # 1. Stop — acquires and releases action_lock
     await session_manager.stop_agent(user["id"])
-
-    # 2. Short pause so process cleanup completes before spawning new one
     await asyncio.sleep(1.0)
-
-    # 3. Start — acquires action_lock independently (no nesting → no deadlock)
     await session_manager.start_pairing(user["id"], phone_number=clean_phone)
     return {"message": "Agent restarting for fresh pairing code.", "status": "pairing"}
 
@@ -295,6 +289,27 @@ async def get_contacts(
 ):
     contacts = await platform_db.get_contacts(user["id"], search=search, is_group=is_group)
     return {"contacts": contacts, "total": len(contacts)}
+
+
+@app.get("/api/contacts/sync-status")
+async def get_contact_sync_status(user: Dict = Depends(get_current_user)):
+    """
+    Returns:
+    - total:            all contacts in DB for this user
+    - recently_synced:  contacts updated in the last 10 minutes
+    - live_count:       in-memory running tally from the active session
+    - is_syncing:       True if an agent session is currently active
+    """
+    db_status = await platform_db.get_contact_sync_status(user["id"], minutes=10)
+    session = session_manager.sessions.get(user["id"])
+    live_count = session.contact_sync_count if session else 0
+    is_syncing = bool(session and session.is_running)
+
+    return {
+        **db_status,
+        "live_count": live_count,
+        "is_syncing": is_syncing,
+    }
 
 
 @app.get("/api/contacts/top")
@@ -381,9 +396,7 @@ async def update_allowlist(req: AllowlistUpdate, user: Dict = Depends(get_curren
 
 
 @app.post("/api/settings/contact-tone")
-async def update_contact_tone(
-    req: ContactToneUpdate, user: Dict = Depends(get_current_user)
-):
+async def update_contact_tone(req: ContactToneUpdate, user: Dict = Depends(get_current_user)):
     pool_conn = await platform_db._pool()
     async with pool_conn.acquire() as conn:
         await conn.execute("""
@@ -399,16 +412,14 @@ async def update_contact_tone(
     if req.soul_content and s and s.controller:
         s.controller.update_contact_soul(req.contact_jid, req.soul_content)
 
-    if (req.custom_tone is not None or req.custom_language is not None) and s and s.controller and req.custom_tone:
+    if (req.custom_tone is not None) and s and s.controller and req.custom_tone:
         s.controller.update_contact_tone_live(req.contact_jid, req.custom_tone)
 
     return {"message": f"Contact settings updated for {req.contact_jid}"}
 
 
 @app.post("/api/settings/contact-soul/generate")
-async def generate_contact_soul(
-    req: ContactSoulRequest, user: Dict = Depends(get_current_user)
-):
+async def generate_contact_soul(req: ContactSoulRequest, user: Dict = Depends(get_current_user)):
     s = session_manager.sessions.get(user["id"])
     if not s or not s.controller:
         raise HTTPException(status_code=400, detail="Agent must be running")
@@ -534,6 +545,7 @@ async def get_analytics(user: Dict = Depends(get_current_user)):
         "total_contacts": len(contacts),
         "allowed_contacts": len(allowed),
         "total_messages": total_messages,
+        "contact_sync_count": s.contact_sync_count if s else 0,
     }
 
 
@@ -544,10 +556,19 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
     await websocket.accept()
     session_manager.add_ws_client(user_id, websocket)
 
+    # Send current state on connect
     status = await session_manager.get_session_status(user_id)
     await websocket.send_json({"type": "status", **status})
     if status.get("pairing_code"):
         await websocket.send_json({"type": "pairing_code", "data": status["pairing_code"]})
+
+    # Send current contact count so UI can show it immediately on reconnect
+    session = session_manager.sessions.get(user_id)
+    if session and session.contact_sync_count > 0:
+        await websocket.send_json({
+            "type": "contacts_progress",
+            "count": session.contact_sync_count,
+        })
 
     try:
         while True:
@@ -558,6 +579,12 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 elif data == "status":
                     s = await session_manager.get_session_status(user_id)
                     await websocket.send_json({"type": "status", **s})
+                elif data == "sync_contacts":
+                    # Client can request a manual contact sync via WS
+                    sess = session_manager.sessions.get(user_id)
+                    if sess and sess.controller:
+                        asyncio.create_task(sess.controller._sync_contacts())
+                        await websocket.send_json({"type": "sync_triggered"})
             except asyncio.TimeoutError:
                 await websocket.send_json({"type": "ping"})
     except (WebSocketDisconnect, Exception):

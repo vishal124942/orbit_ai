@@ -1,4 +1,4 @@
-console.error("🚀 DEBUG: GATEWAY VERSION 3.0 STARTING");
+console.error("🚀 DEBUG: GATEWAY VERSION 3.1 STARTING");
 const {
     default: makeWASocket,
     useMultiFileAuthState,
@@ -6,7 +6,8 @@ const {
     fetchLatestBaileysVersion,
     makeCacheableSignalKeyStore,
     isJidGroup,
-    downloadMediaMessage
+    downloadMediaMessage,
+    makeInMemoryStore,
 } = require('@whiskeysockets/baileys');
 const { writeFile } = require('fs/promises');
 const path = require('path');
@@ -17,7 +18,7 @@ const os = require('os');
 const crypto = require('crypto');
 const util = require('util');
 
-// Configuration
+// ── Configuration ─────────────────────────────────────────────────────────────
 const AUTH_DIR = process.argv[2] || path.join(os.homedir(), '.ai-agent-system', 'credentials', 'whatsapp', 'default');
 const phoneNumber = process.argv[3] && process.argv[3] !== '--clear-state' ? process.argv[3].replace(/[^0-9]/g, '') : null;
 const isClearStateCmd = process.argv.includes('--clear-state');
@@ -25,11 +26,10 @@ const isClearStateCmd = process.argv.includes('--clear-state');
 const MEDIA_DIR = path.join(__dirname, '../../../data/media');
 const logger = P({ level: 'silent' });
 
-// ── CLEAR STATE COMMAND (CLI UTILITY) ───────────────────────────────────────
+// ── CLEAR STATE COMMAND ───────────────────────────────────────────────────────
 if (isClearStateCmd) {
     console.error(`[Gateway Utility] Executing --clear-state for ${AUTH_DIR}`);
     const sessionName = process.env.WHATSAPP_SESSION_ID || path.basename(AUTH_DIR);
-
     (async () => {
         try {
             if (process.env.R2_BUCKET_NAME) {
@@ -39,9 +39,7 @@ if (isClearStateCmd) {
                 if (auth.clearState) await auth.clearState();
             } else {
                 console.error(`[Gateway Utility] Wiping Local Directory: ${AUTH_DIR}`);
-                if (fs.existsSync(AUTH_DIR)) {
-                    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-                }
+                if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true });
             }
             console.error(`[Gateway Utility] Cleanup successful. Exiting.`);
             process.exit(0);
@@ -52,65 +50,38 @@ if (isClearStateCmd) {
     })();
     return;
 }
-// ────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
-console.error(`[Gateway V3.0] Using AUTH_DIR: ${AUTH_DIR}`);
-if (phoneNumber) console.error(`[Gateway V3.0] Using Pairing Code for phone: ${phoneNumber}`);
+console.error(`[Gateway V3.1] Using AUTH_DIR: ${AUTH_DIR}`);
+if (phoneNumber) console.error(`[Gateway V3.1] Using Pairing Code for phone: ${phoneNumber}`);
 
-function requestRestartAndExit(reason, delay = 500) {
-    console.error(`[Gateway] Requesting restart from Python: ${reason}`);
-
-    // KILL the socket immediately so the next session doesn't hit a 440 Conflict
-    if (sock) {
-        try {
-            console.error('[Gateway] Closing socket before restart...');
-            sock.ev.removeAllListeners();
-            sock.end();
-            sock.ws.close();
-        } catch (e) {
-            console.error(`[Gateway] Error closing socket: ${e.message}`);
-        }
-    }
-
-    console.log(JSON.stringify({ type: 'restart_requested', reason }));
-    setTimeout(() => {
-        console.error('[Gateway] Exiting now.');
-        process.exit(0);
-    }, delay);
-}
-
-// Connection state management
+// ── State ─────────────────────────────────────────────────────────────────────
 let sock = null;
 let isConnected = false;
 let messageQueue = [];
 let isProcessingQueue = false;
-let contacts = {};
-
-// ── Contact flush strategy ───────────────────────────────────────────────────
-//
-// ROOT CAUSES OF "8-10 CONTACTS ONLY" BUG:
-//
-// CAUSE 1 (primary, Node-side): contacts.upsert on a linked device ONLY fires
-//   for contacts who appear in the device's recent chat history, NOT the full
-//   phone address book.  WhatsApp's multi-device protocol only pushes the
-//   address book to the primary phone; linked devices get a subset derived from
-//   active conversations.
-//
-//   FIX: Mine ALL unique JIDs from messaging-history.set messages and inject
-//   them into the contacts map with their pushName as a stub entry.  This
-//   ensures every JID that has ever sent or received a message is captured as
-//   a contact even if WhatsApp never fired contacts.upsert for them.
-//
-// CAUSE 2: Debounce cancellation race (documented in V2).
-// CAUSE 3: Python-side silent failures (fixed in session_manager + pg_models).
-// ─────────────────────────────────────────────────────────────────────────────
-
+let contacts = {};            // jid → contact object (in-memory cache)
 let contactsDebounceTimer = null;
 let periodicSyncTimer = null;
+let contactSyncTotal = 0;    // running count for progress events
 
-/**
- * Determine if a JID is a real individual contact (not group/broadcast/status).
- */
+// ── Restart helper ─────────────────────────────────────────────────────────────
+function requestRestartAndExit(reason, delay = 500) {
+    console.error(`[Gateway] Requesting restart from Python: ${reason}`);
+    if (sock) {
+        try {
+            sock.ev.removeAllListeners();
+            sock.end();
+            sock.ws?.close();
+        } catch (e) {
+            console.error(`[Gateway] Error closing socket: ${e.message}`);
+        }
+    }
+    console.log(JSON.stringify({ type: 'restart_requested', reason }));
+    setTimeout(() => { console.error('[Gateway] Exiting now.'); process.exit(0); }, delay);
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
 function isIndividualJid(jid) {
     if (!jid) return false;
     if (jid.includes('broadcast') || jid.includes('status@') || jid.includes('newsletter')) return false;
@@ -118,8 +89,10 @@ function isIndividualJid(jid) {
     return jid.endsWith('@s.whatsapp.net') || jid.endsWith('@lid');
 }
 
-/** Serialise and emit the full contacts map on stdout — never throws. */
-function sendContactsNow() {
+/**
+ * Emit contacts on stdout. Never throws.
+ */
+function sendContactsNow(forceAll = false) {
     try {
         const raw = Object.values(contacts);
         const cleaned = raw.filter(c => isIndividualJid(c.id)).map(c => {
@@ -134,18 +107,25 @@ function sendContactsNow() {
                 lidId: lidRaw,
             };
         });
-        console.error(`[Gateway] Sending ${cleaned.length} contacts (filtered from ${raw.length} raw)`);
-        cleaned.slice(0, 5).forEach((c, i) =>
-            console.error(`[Gateway]   Sample[${i}]: id=${c.id}, name=${c.name || 'NONE'}, isLid=${c.isLid}`)
+        console.error(`[Gateway] Sending ${cleaned.length} contacts (from ${raw.length} raw)`);
+        cleaned.slice(0, 3).forEach((c, i) =>
+            console.error(`[Gateway]   Sample[${i}]: id=${c.id}, name=${c.name || 'NONE'}`)
         );
         console.log(JSON.stringify({ type: 'contacts', data: cleaned }));
+
+        // Also emit progress update so Python can broadcast live count to frontend
+        const count = cleaned.length;
+        if (count !== contactSyncTotal) {
+            contactSyncTotal = count;
+            console.log(JSON.stringify({ type: 'contact_sync_progress', count }));
+        }
     } catch (err) {
         console.error('[Gateway] sendContactsNow error:', err.message);
     }
 }
 
 /**
- * Flush NOW and arm a 1 s trailing debounce.
+ * Emit in batches — flush immediately then trailing debounce to catch stragglers.
  */
 function flushContactsWithTrailingDebounce() {
     sendContactsNow();
@@ -156,68 +136,86 @@ function flushContactsWithTrailingDebounce() {
     }, 1000);
 }
 
+/**
+ * Inject new contacts from a list of JIDs+names and flush immediately if new ones appeared.
+ * Returns the count of newly added entries.
+ */
+function mergeContacts(entries) {
+    let newCount = 0;
+    for (const entry of entries) {
+        const { id, name, notify, pushName } = entry;
+        if (!id || !isIndividualJid(id)) continue;
+        if (!contacts[id]) {
+            contacts[id] = { id, name: name || null, notify: notify || pushName || null, pushName: pushName || null };
+            newCount++;
+        } else {
+            // Upgrade stub: never overwrite real name with null
+            if (!contacts[id].name && (name || notify)) {
+                contacts[id].name = name || notify || null;
+                contacts[id].notify = notify || pushName || contacts[id].notify || null;
+            }
+        }
+    }
+    if (newCount > 0) {
+        console.error(`[Gateway] mergeContacts: +${newCount} (Total: ${Object.keys(contacts).length})`);
+    }
+    return newCount;
+}
+
+/**
+ * Mine unique individual JIDs from message list and create stub contacts.
+ */
+function mineContactsFromMessages(messages) {
+    const entries = [];
+    for (const msg of messages) {
+        const jid = msg.key?.remoteJid;
+        if (!jid || !isIndividualJid(jid)) continue;
+        entries.push({ id: jid, pushName: msg.pushName || null });
+    }
+    return mergeContacts(entries);
+}
+
+/**
+ * Mine JIDs from Baileys in-memory store contacts object (key → contact).
+ * This is the richest single source — covers everyone ever chatted with.
+ */
+function mineFromSockContacts() {
+    if (!sock) return 0;
+    try {
+        const storeContacts = sock.contacts || {};
+        const entries = Object.values(storeContacts).map(c => ({
+            id: c.id,
+            name: c.name || null,
+            notify: c.notify || null,
+            pushName: null,
+        }));
+        const added = mergeContacts(entries);
+        if (added > 0) {
+            console.error(`[Gateway] mineFromSockContacts: +${added} from sock.contacts store`);
+        }
+        return added;
+    } catch (e) {
+        console.error('[Gateway] mineFromSockContacts error:', e.message);
+        return 0;
+    }
+}
+
 function startPeriodicContactSync() {
     stopPeriodicContactSync();
     periodicSyncTimer = setInterval(() => {
         if (isConnected) {
             console.error('[Gateway] Periodic contact sync');
+            mineFromSockContacts();
             sendContactsNow();
         }
-    }, 5 * 60 * 1000);
+    }, 5 * 60 * 1000); // every 5 min
 }
 
 function stopPeriodicContactSync() {
     if (periodicSyncTimer) { clearInterval(periodicSyncTimer); periodicSyncTimer = null; }
 }
 
-/**
- * FIX (CAUSE 1): Mine JIDs from message history and inject them as stub contacts.
- *
- * WHY THIS MATTERS:
- *   WhatsApp's multi-device protocol sends contacts.upsert only for peers who
- *   appear in the server-side "contact book" that was synced to the linked device.
- *   This is typically the last ~30-50 conversations.  Everyone else is invisible.
- *
- *   However, messaging-history.set contains every conversation ever synced.
- *   By walking those messages and inserting any unseen JID into the contacts map
- *   (with pushName as the display label), we capture the full set of people the
- *   user has actually talked to — which is the most useful definition of "contacts"
- *   for the allowlist feature anyway.
- *
- * SAFETY:
- *   We never overwrite an existing entry that already has a real name.  The stub
- *   will be upgraded later if contacts.update fires a proper name for it.
- */
-function mineContactsFromMessages(messages) {
-    let newCount = 0;
-    for (const msg of messages) {
-        const jid = msg.key?.remoteJid;
-        if (!jid || !isIndividualJid(jid)) continue;
-
-        if (!contacts[jid]) {
-            // Stub — will be enriched by contacts.upsert/update later
-            contacts[jid] = {
-                id: jid,
-                notify: msg.pushName || null,
-                pushName: msg.pushName || null,
-            };
-            newCount++;
-        } else {
-            // Upgrade stub with pushName if we don't yet have any name
-            if (!contacts[jid].name && !contacts[jid].notify && msg.pushName) {
-                contacts[jid].notify = msg.pushName;
-            }
-        }
-
-        // Also capture the sender's own JID for group messages where fromMe=false
-        // (the real sender is in participant, not remoteJid for groups — skip groups above)
-    }
-    if (newCount > 0) {
-        console.error(`[Gateway] mineContactsFromMessages: added ${newCount} new stubs (Total: ${Object.keys(contacts).length})`);
-    }
-}
-
-// Ensure directories exist
+// ── Media helpers ─────────────────────────────────────────────────────────────
 [MEDIA_DIR].forEach(dir => {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
@@ -232,6 +230,31 @@ function findExistingMedia(hash) {
     return match ? path.join(MEDIA_DIR, match) : null;
 }
 
+async function downloadAndSaveMedia(msg, messageType) {
+    try {
+        const buffer = await downloadMediaMessage(msg, 'buffer', {});
+        const hash = getFileHash(buffer);
+        const mediaTypeMap = { audio: 'ogg', video: 'mp4', image: 'jpg', sticker: 'webp' };
+        const mediaType = messageType.replace('Message', '');
+        const extension = mediaTypeMap[mediaType] || 'bin';
+
+        let mediaPath = findExistingMedia(hash);
+        if (!mediaPath) {
+            const fileName = `${hash}.${extension}`;
+            mediaPath = path.join(MEDIA_DIR, fileName);
+            await writeFile(mediaPath, buffer);
+            console.error(`[Media] Saved new ${mediaType}: ${fileName}`);
+        } else {
+            console.error(`[Media] Using existing ${mediaType}: ${path.basename(mediaPath)}`);
+        }
+        return { mediaPath, mediaType };
+    } catch (err) {
+        console.error("[Media Error] Download failed:", err.message);
+        return { mediaPath: null, mediaType: null };
+    }
+}
+
+// ── Message queue ─────────────────────────────────────────────────────────────
 async function processMessageQueue() {
     if (isProcessingQueue || messageQueue.length === 0) return;
     isProcessingQueue = true;
@@ -253,7 +276,7 @@ async function executeCommand(command) {
     try {
         await sock.presenceSubscribe(target);
         await sock.sendPresenceUpdate('composing', target);
-    } catch (e) { }
+    } catch (e) { /* non-critical */ }
 
     let retries = 3;
     let lastError = null;
@@ -262,8 +285,10 @@ async function executeCommand(command) {
             if (command.type === 'send_message') await sendMessage(target, command);
             else if (command.type === 'react') await sendReaction(target, command);
             else if (command.type === 'delete_message') await deleteMessage(target, command);
-            else if (command.type === 'get_contacts') sendContactsNow();
-
+            else if (command.type === 'get_contacts') {
+                mineFromSockContacts();
+                sendContactsNow();
+            }
             console.log(JSON.stringify({ type: 'ack', id: command.id, success: true }));
             try { await sock.sendPresenceUpdate('paused', target); } catch (e) { }
             return;
@@ -286,9 +311,9 @@ async function sendMessage(target, command) {
         const ext = path.extname(mediaPath).toLowerCase();
         if (ext === '.webp' || command.mediaType === 'sticker')
             options = { sticker: isUrl ? { url: mediaPath } : fs.readFileSync(mediaPath) };
-        else if (ext === '.mp4' || ext === '.mkv' || ext === '.avi' || command.mediaType === 'video')
+        else if (['.mp4', '.mkv', '.avi'].includes(ext) || command.mediaType === 'video')
             options = { video: isUrl ? { url: mediaPath } : fs.readFileSync(mediaPath), caption: command.text || '' };
-        else if (ext === '.ogg' || ext === '.mp3' || ext === '.m4a' || ext === '.opus' || command.mediaType === 'audio')
+        else if (['.ogg', '.mp3', '.m4a', '.opus'].includes(ext) || command.mediaType === 'audio')
             options = { audio: isUrl ? { url: mediaPath } : fs.readFileSync(mediaPath), mimetype: 'audio/mp4', ptt: true };
         else
             options = { image: isUrl ? { url: mediaPath } : fs.readFileSync(mediaPath), caption: command.text || '' };
@@ -318,30 +343,7 @@ function formatJid(jid) {
     return `${jid.replace(/\D/g, '')}@s.whatsapp.net`;
 }
 
-async function downloadAndSaveMedia(msg, messageType) {
-    try {
-        const buffer = await downloadMediaMessage(msg, 'buffer', {});
-        const hash = getFileHash(buffer);
-        const mediaTypeMap = { audio: 'ogg', video: 'mp4', image: 'jpg', sticker: 'webp' };
-        const mediaType = messageType.replace('Message', '');
-        const extension = mediaTypeMap[mediaType] || 'bin';
-
-        let mediaPath = findExistingMedia(hash);
-        if (!mediaPath) {
-            const fileName = `${hash}.${extension}`;
-            mediaPath = path.join(MEDIA_DIR, fileName);
-            await writeFile(mediaPath, buffer);
-            console.error(`[Media] Saved new ${mediaType}: ${fileName}`);
-        } else {
-            console.error(`[Media] Using existing ${mediaType}: ${path.basename(mediaPath)}`);
-        }
-        return { mediaPath, mediaType };
-    } catch (err) {
-        console.error("[Media Error] Download failed:", err.message);
-        return { mediaPath: null, mediaType: null };
-    }
-}
-
+// ── Gateway startup ───────────────────────────────────────────────────────────
 const { useR2AuthState } = require('./r2_auth_state');
 
 async function startGateway() {
@@ -365,11 +367,9 @@ async function startGateway() {
         };
     }
 
+    // Wipe stale partial creds if in pairing mode
     if (phoneNumber && !state.creds.registered) {
-        const hasStalePartialCreds = !!(
-            state.creds.me || state.creds.account ||
-            state.creds.signedPreKey || state.creds.registrationId
-        );
+        const hasStalePartialCreds = !!(state.creds.me || state.creds.account || state.creds.signedPreKey || state.creds.registrationId);
         if (hasStalePartialCreds) {
             console.error('[Gateway] Pairing mode: stale partial creds detected — wiping...');
             try {
@@ -387,8 +387,6 @@ async function startGateway() {
             } catch (wipeErr) {
                 console.error('[Gateway] Warning: could not wipe stale creds:', wipeErr.message);
             }
-        } else {
-            console.error('[Gateway] Pairing mode: no stale creds found.');
         }
     }
 
@@ -410,67 +408,93 @@ async function startGateway() {
         defaultQueryTimeoutMs: 60000,
         keepAliveIntervalMs: 30000,
         retryRequestDelayMs: 500,
-        // FIX: Keep false for performance, but we now mine contacts from history messages
-        // so we get full coverage without the heavy full-history sync.
         syncFullHistory: false,
         markOnlineOnConnect: false,
+        // Keep store so sock.contacts is populated
+        generateHighQualityLinkPreview: false,
     });
 
     let isPairingCodeRequested = false;
     sock.ev.on('creds.update', saveCreds);
 
-    // ── contacts.upsert: server address book entries ──────────────────────────
+    // ── contacts.upsert ───────────────────────────────────────────────────────
     sock.ev.on('contacts.upsert', (newContacts) => {
-        newContacts.forEach(c => {
-            if (!c.id || c.id.includes('broadcast')) return;
-            contacts[c.id] = { ...contacts[c.id], ...c };
-        });
-        console.error(`[Gateway] contacts.upsert: +${newContacts.length} (Total: ${Object.keys(contacts).length})`);
+        const added = mergeContacts(newContacts.map(c => ({
+            id: c.id,
+            name: c.name || null,
+            notify: c.notify || null,
+            pushName: c.notify || null,
+        })));
+        console.error(`[Gateway] contacts.upsert: +${newContacts.length} raw, +${added} new (Total: ${Object.keys(contacts).length})`);
         flushContactsWithTrailingDebounce();
     });
 
-    // ── contacts.update: name/notify changes ─────────────────────────────────
+    // ── contacts.update ───────────────────────────────────────────────────────
     sock.ev.on('contacts.update', (updates) => {
         updates.forEach(u => {
             if (!u.id || u.id.includes('broadcast')) return;
             if (contacts[u.id]) {
                 const hasName = u.name || u.notify || u.pushName;
-                if (!contacts[u.id].name || hasName) {
-                    contacts[u.id] = { ...contacts[u.id], ...u };
-                } else {
-                    const { name, notify, pushName, ...rest } = u;
-                    contacts[u.id] = { ...contacts[u.id], ...rest };
-                }
+                contacts[u.id] = hasName
+                    ? { ...contacts[u.id], ...u }
+                    : { ...contacts[u.id], ...u, name: contacts[u.id].name }; // preserve existing name
             } else {
                 contacts[u.id] = u;
             }
         });
-        console.error(`[Gateway] contacts.update: ${updates.length} updates (Total: ${Object.keys(contacts).length})`);
+        console.error(`[Gateway] contacts.update: ${updates.length} (Total: ${Object.keys(contacts).length})`);
         flushContactsWithTrailingDebounce();
     });
 
-    // ── messaging-history.set: the richest contact source ────────────────────
+    // ── chats.set — fired after history sync, contains ALL chat JIDs ──────────
+    // This is a goldmine: every conversation ever, regardless of whether
+    // WhatsApp sent a contacts.upsert for them.
+    sock.ev.on('chats.set', ({ chats }) => {
+        if (!chats || chats.length === 0) return;
+        const entries = chats
+            .filter(c => c.id && isIndividualJid(c.id))
+            .map(c => ({
+                id: c.id,
+                name: c.name || null,
+                notify: c.name || null,
+                pushName: null,
+            }));
+        const added = mergeContacts(entries);
+        console.error(`[Gateway] chats.set: ${chats.length} chats → +${added} new contacts (Total: ${Object.keys(contacts).length})`);
+        if (added > 0) flushContactsWithTrailingDebounce();
+    });
+
+    // ── chats.upsert — incremental chat additions ─────────────────────────────
+    sock.ev.on('chats.upsert', (chats) => {
+        if (!chats || chats.length === 0) return;
+        const entries = chats
+            .filter(c => c.id && isIndividualJid(c.id))
+            .map(c => ({ id: c.id, name: c.name || null }));
+        const added = mergeContacts(entries);
+        if (added > 0) {
+            console.error(`[Gateway] chats.upsert: +${added} new (Total: ${Object.keys(contacts).length})`);
+            flushContactsWithTrailingDebounce();
+        }
+    });
+
+    // ── messaging-history.set ─────────────────────────────────────────────────
     sock.ev.on('messaging-history.set', (history) => {
-        // 1. Capture explicit contacts from history metadata
+        // 1. Explicit contacts in history payload
         const historyContacts = history.contacts || [];
-        historyContacts.forEach(c => {
-            if (!c.id || c.id.includes('broadcast')) return;
-            contacts[c.id] = { ...contacts[c.id], ...c };
-        });
-        console.error(`[Gateway] History sync: ${historyContacts.length} explicit contacts (Total before mining: ${Object.keys(contacts).length})`);
+        const added1 = mergeContacts(historyContacts.map(c => ({
+            id: c.id,
+            name: c.name || null,
+            notify: c.notify || null,
+        })));
 
-        // 2. FIX (CAUSE 1): Mine ALL message senders/recipients as stub contacts.
-        //    This is the primary fix for the "8-10 contacts only" bug.
-        //    contacts.upsert on a linked device only covers recent chats (~30-50).
-        //    Message history covers EVERY conversation ever synced to this device.
+        // 2. Mine all message senders
         const historyMessages = history.messages || [];
-        mineContactsFromMessages(historyMessages);
-        console.error(`[Gateway] After mining messages: ${Object.keys(contacts).length} total contacts`);
+        const added2 = mineContactsFromMessages(historyMessages);
 
-        // Flush immediately — data is now in stdout buffer before any timer can be cancelled
+        console.error(`[Gateway] messaging-history.set: ${historyContacts.length} explicit + ${added2} mined (Total: ${Object.keys(contacts).length})`);
         flushContactsWithTrailingDebounce();
 
-        // 3. Emit history messages for context
+        // 3. Emit history messages for context (capped per contact)
         const MAX_HISTORY_PER_CONTACT = 200;
         if (historyMessages.length > 0) {
             const byContact = {};
@@ -489,20 +513,22 @@ async function startGateway() {
                 });
             }
             const capped = [];
-            for (const [jid, msgs] of Object.entries(byContact)) {
+            for (const [, msgs] of Object.entries(byContact)) {
                 msgs.sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0));
                 capped.push(...msgs.slice(0, MAX_HISTORY_PER_CONTACT));
             }
             if (capped.length > 0) {
-                console.error(`[Gateway] History sync: emitting ${capped.length} msgs (from ${historyMessages.length} raw)`);
+                console.error(`[Gateway] History: emitting ${capped.length} msgs`);
                 console.log(JSON.stringify({ type: 'history_messages', data: capped }));
             }
         }
     });
 
+    // ── connection.update ─────────────────────────────────────────────────────
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
 
+        // Pairing code request
         if (phoneNumber && !state.creds.registered && connection === 'connecting' && !isPairingCodeRequested) {
             isPairingCodeRequested = true;
             await new Promise(resolve => setTimeout(resolve, 2000));
@@ -511,7 +537,7 @@ async function startGateway() {
                 console.error(`[Gateway] Requesting pairing code for: ${cleanPhone}`);
                 let code = await sock.requestPairingCode(cleanPhone);
                 code = code?.match(/.{1,4}/g)?.join('-') || code;
-                console.error(`[Gateway] Pairing code requested successfully: ${code}`);
+                console.error(`[Gateway] Pairing code: ${code}`);
                 console.log(JSON.stringify({ type: 'pairing_code', code }));
             } catch (err) {
                 isPairingCodeRequested = false;
@@ -527,17 +553,33 @@ async function startGateway() {
                 if (statusCode === 401 || statusCode !== DisconnectReason.loggedOut) emitStatus = 'pairing';
             }
             console.log(JSON.stringify({
-                type: 'connection', status: emitStatus,
+                type: 'connection',
+                status: emitStatus,
                 user: connection === 'open' ? sock.user : undefined,
             }));
 
             if (connection === 'open') {
                 isConnected = true;
-                console.error(`[Gateway] Connection opened. Cached contacts: ${Object.keys(contacts).length}`);
+                console.error(`[Gateway] Connection opened. Cached contacts so far: ${Object.keys(contacts).length}`);
 
-                // Flush immediately — no debounce at open time
+                // ── PHASE 1: Immediate flush of whatever we already have ───────
                 sendContactsNow();
-                flushContactsWithTrailingDebounce();
+
+                // ── PHASE 2: Mine sock.contacts store (populated by Baileys) ──
+                // Do this in a small delay so Baileys finishes populating the store
+                setTimeout(() => {
+                    const added = mineFromSockContacts();
+                    if (added > 0) {
+                        console.error(`[Gateway] Post-open sock.contacts mine: +${added}`);
+                        flushContactsWithTrailingDebounce();
+                    }
+                }, 3000);
+
+                // ── PHASE 3: Second sweep after 10s to catch late arrivals ─────
+                setTimeout(() => {
+                    mineFromSockContacts();
+                    sendContactsNow();
+                }, 10000);
 
                 startPeriodicContactSync();
                 processMessageQueue();
@@ -552,15 +594,13 @@ async function startGateway() {
                 const reason = error?.message || 'Unknown';
 
                 console.error(`[Gateway] Connection closed (Status: ${statusCode}), Error: ${reason}`);
-                console.error(`[Gateway] Connection Update Object: ${util.inspect(update, { depth: null, colors: false })}`);
-                if (error) console.error(`[Gateway] Full error context: ${util.inspect(error, { depth: null, colors: false })}`);
+                console.error(`[Gateway] Update: ${util.inspect(update, { depth: null, colors: false })}`);
 
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
                 if (shouldReconnect) {
-                    const isConflict = reason && reason.toLowerCase().includes('conflict');
+                    const isConflict = reason?.toLowerCase().includes('conflict');
                     const isRestartRequired = statusCode === 515 || statusCode === '515';
                     const delay = isConflict || isRestartRequired ? 5000 : 500;
-                    console.error(`[Gateway] Scheduling restart via Python in ${delay}ms`);
                     setTimeout(() => requestRestartAndExit(reason, 500), delay);
                 } else {
                     console.error('[Gateway] Logged out (401). Clearing auth state...');
@@ -574,11 +614,13 @@ async function startGateway() {
         }
     });
 
+    // ── messages.upsert ───────────────────────────────────────────────────────
     sock.ev.on('messages.upsert', async (m) => {
         if (m.type === 'append') {
-            // FIX: Mine contacts from appended history messages too
-            mineContactsFromMessages(m.messages);
+            const added = mineContactsFromMessages(m.messages);
+            if (added > 0) flushContactsWithTrailingDebounce();
 
+            // Emit history messages
             const MAX_PER_CONTACT = 200;
             const byContact = {};
             for (const msg of m.messages) {
@@ -594,7 +636,7 @@ async function startGateway() {
                 });
             }
             const capped = [];
-            for (const [jid, msgs] of Object.entries(byContact)) {
+            for (const [, msgs] of Object.entries(byContact)) {
                 msgs.sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0));
                 capped.push(...msgs.slice(0, MAX_PER_CONTACT));
             }
@@ -614,10 +656,13 @@ async function startGateway() {
                 let text = msg.message?.conversation || msg.message?.extendedTextMessage?.text ||
                     msg.message?.imageMessage?.caption || msg.message?.videoMessage?.caption || "";
 
+                // Remote stop/start commands
                 if (msg.key.fromMe && text.trim().toLowerCase().match(/^(stop|start)$/)) {
                     console.error(`[Gateway] Detected remote ${text.trim().toLowerCase()} command`);
                     console.log(JSON.stringify({
-                        type: 'agent_control', command: text.trim().toLowerCase(), from: msg.key.remoteJid,
+                        type: 'agent_control',
+                        command: text.trim().toLowerCase(),
+                        from: msg.key.remoteJid,
                     }));
                 }
 
@@ -630,29 +675,32 @@ async function startGateway() {
                     else if (!text && mediaType) text = `[Sent a ${mediaType}]`;
                 }
 
-                // Update in-memory contact map for any new senders
+                // Upsert sender into contacts cache
                 if (msg.key.remoteJid && !msg.key.remoteJid.includes('broadcast')) {
-                    if (!contacts[msg.key.remoteJid]) {
-                        contacts[msg.key.remoteJid] = {
-                            id: msg.key.remoteJid,
-                            notify: msg.pushName || null,
-                        };
-                    } else if (!contacts[msg.key.remoteJid].name && msg.pushName) {
-                        contacts[msg.key.remoteJid].notify = msg.pushName;
-                    }
+                    mergeContacts([{
+                        id: msg.key.remoteJid,
+                        notify: msg.pushName || null,
+                        pushName: msg.pushName || null,
+                    }]);
                 }
 
                 console.log(JSON.stringify({
-                    type: 'message', id: msg.key.id, from: msg.key.remoteJid,
-                    pushName: msg.pushName, text, mediaPath, mediaType,
+                    type: 'message',
+                    id: msg.key.id,
+                    from: msg.key.remoteJid,
+                    pushName: msg.pushName,
+                    text,
+                    mediaPath,
+                    mediaType,
                     timestamp: msg.messageTimestamp,
-                    isGroup: isJidGroup(msg.key.remoteJid), fromMe: msg.key.fromMe,
+                    isGroup: isJidGroup(msg.key.remoteJid),
+                    fromMe: msg.key.fromMe,
                 }));
             }
         }
     });
 
-    // Buffer for incoming stdin commands
+    // ── stdin command reader ──────────────────────────────────────────────────
     let buffer = '';
     process.stdin.on('data', async (data) => {
         buffer += data.toString();
@@ -670,24 +718,23 @@ async function startGateway() {
         }
     });
 
-    // Health check ping
+    // ── Health check ──────────────────────────────────────────────────────────
     setInterval(() => {
         if (isConnected && sock) {
-            console.error('[Health] Gateway alive, queue:', messageQueue.length,
-                'contacts:', Object.keys(contacts).length);
+            console.error(`[Health] Gateway alive | queue: ${messageQueue.length} | contacts: ${Object.keys(contacts).length}`);
         }
     }, 60000);
 }
 
-// Graceful shutdown
+// ── Graceful shutdown ─────────────────────────────────────────────────────────
 process.on('SIGINT', () => {
-    console.error('[Gateway] Received SIGINT. Shutting down gracefully...');
+    console.error('[Gateway] Received SIGINT. Shutting down...');
     stopPeriodicContactSync();
     if (sock) sock.end();
     process.exit(0);
 });
 process.on('SIGTERM', () => {
-    console.error('[Gateway] Received SIGTERM. Shutting down gracefully...');
+    console.error('[Gateway] Received SIGTERM. Shutting down...');
     stopPeriodicContactSync();
     if (sock) sock.end();
     process.exit(0);
