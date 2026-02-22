@@ -7,12 +7,16 @@ import axios from 'axios'
  * Pairing Code Poller — REST polling as the primary delivery mechanism.
  * Works even if WebSocket is flaky. Polls /api/whatsapp/pairing-code every 2.5s.
  */
-function usePairingCodePoller(enabled, onPairingCode, onConnected) {
+function usePairingCodePoller(enabled, hasActiveCode, onPairingCode, onConnected) {
     const timerRef = useRef(null)
 
     useEffect(() => {
-        if (!enabled) {
-            if (timerRef.current) clearInterval(timerRef.current)
+        // If not enabled, or we already have a code on screen, DO NOT poll
+        if (!enabled || hasActiveCode) {
+            if (timerRef.current) {
+                clearInterval(timerRef.current)
+                timerRef.current = null
+            }
             return
         }
 
@@ -46,7 +50,7 @@ function usePairingCodePoller(enabled, onPairingCode, onConnected) {
         return () => {
             if (timerRef.current) clearInterval(timerRef.current)
         }
-    }, [enabled])
+    }, [enabled, hasActiveCode])
 }
 
 export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, onStatusChange, onAnalyticsRefresh }) {
@@ -60,6 +64,7 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
 
     usePairingCodePoller(
         waStatus === 'pairing',
+        !!activePairingCode,
         setPolledPairingCode,
         () => { onStatusChange('connected'); onAnalyticsRefresh?.() }
     )
