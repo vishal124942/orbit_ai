@@ -510,9 +510,20 @@ async function startGateway() {
         }
 
         if (connection) {
+            let emitStatus = connection;
+
+            if (connection === 'close') {
+                const statusCode = lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.code;
+                // If the script intends to auto-restart (like on 401 unauthorized pairing requests), 
+                // fake the status as 'pairing' so Python / React doesn't wildly flicker to 'Offline'
+                if (statusCode === 401 || statusCode !== DisconnectReason.loggedOut) {
+                    emitStatus = 'pairing';
+                }
+            }
+
             console.log(JSON.stringify({
                 type: 'connection',
-                status: connection,
+                status: emitStatus,
                 user: connection === 'open' ? sock.user : undefined
             }));
 

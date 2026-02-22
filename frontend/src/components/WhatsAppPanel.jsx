@@ -143,11 +143,15 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
         setMessage('')
         setPolledPairingCode(null)
         onClearPairingCode?.() // Ensures the Dashboard's global WebSocket code state is wiped so polling completely resumes
+        // Temporarily pause the poller by shifting status off 'pairing' to avoid a race condition 
+        // where it immediately fetches the dying session's code before the backend wipes it.
+        onStatusChange('regenerating')
         try {
             await regenerateWaCode()
             onStatusChange('pairing')
             setMessage('Generating fresh pairing code...')
         } catch (e) {
+            onStatusChange('pairing') // Revert on failure
             setMessage(e.response?.data?.detail || 'Failed to regenerate code')
         } finally {
             setLoading(false)
