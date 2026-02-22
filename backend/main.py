@@ -275,8 +275,8 @@ async def get_top_contacts(
                     stats = msg_stats.get(jid, {"msg_count": 0, "last_msg": None, "has_history": False})
                     c.update(stats)
                 
-                # Sort by most recently contacted
-                real_contacts.sort(key=lambda x: x.get("last_msg") or "", reverse=True)
+                # Sort by most recently contacted (safe fallback for None)
+                real_contacts.sort(key=lambda x: str(x.get("last_msg") or ""), reverse=True)
             finally:
                 db_conn.close()
     
