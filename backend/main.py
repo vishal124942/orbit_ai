@@ -243,6 +243,10 @@ async def wa_regenerate(user: Dict = Depends(get_current_user)):
             detail="No phone number bound to this account. Cannot regenerate pairing code."
         )
 
+    # Clean the phone number of any WhatsApp multi-device suffixes (e.g., :53)
+    # Baileys requestPairingCode explicitly requires purely the digits.
+    clean_phone = phone_number.split(':')[0]
+
     # 1. Kill the stale background WhatsApp process
     await session_manager.stop_agent(user["id"])
     
@@ -250,8 +254,8 @@ async def wa_regenerate(user: Dict = Depends(get_current_user)):
     import asyncio
     await asyncio.sleep(1.0)
     
-    # 3. Spin it back up
-    await session_manager.start_pairing(user["id"], phone_number=phone_number)
+    # 3. Spin it back up with the clean phone string
+    await session_manager.start_pairing(user["id"], phone_number=clean_phone)
     return {"message": "Agent restarting to generate fresh pairing code.", "status": "pairing"}
 
 
