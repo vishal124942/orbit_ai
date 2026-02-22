@@ -219,7 +219,7 @@ class WhatsAppBridge:
                     code = clean_line.split("Pairing code requested successfully:")[1].strip()
                     if self.callbacks.get('pairing_code'):
                         try:
-                            self.callbacks['pairing_code']({"type": "pairing_code", "data": code})
+                            self.callbacks['pairing_code'](code)
                         except Exception as e:
                             print(f"[Bridge] Pairing callback error: {e}")
                 
