@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { Play, Square, Smartphone, CheckCircle, AlertCircle, Loader, RefreshCw } from 'lucide-react'
 import { startWaAgent, stopWaAgent, regenerateWaCode, useAuthStore } from '../lib/api'
 import axios from 'axios'
@@ -11,7 +11,6 @@ function usePairingCodePoller(enabled, hasActiveCode, onPairingCode, onConnected
     const timerRef = useRef(null)
 
     useEffect(() => {
-        // If not enabled, or we already have a code on screen, DO NOT poll
         if (!enabled || hasActiveCode) {
             if (timerRef.current) {
                 clearInterval(timerRef.current)
@@ -30,7 +29,6 @@ function usePairingCodePoller(enabled, hasActiveCode, onPairingCode, onConnected
 
                 if (res.data.has_pairing_code) {
                     onPairingCode(res.data.pairing_code)
-                    // Once we have the code, stop hammering the backend
                     if (timerRef.current) {
                         clearInterval(timerRef.current)
                         timerRef.current = null
@@ -59,6 +57,30 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
     const [polledPairingCode, setPolledPairingCode] = useState(null)
     const [phoneNumber, setPhoneNumber] = useState('')
 
+    // ── FIX: Single in-flight guard ─────────────────────────────────────────
+    // Prevents two API calls from racing each other when the user double-clicks
+    // or when the polling interval fires exactly as an action button is clicked.
+    // Using a ref (not state) so it's synchronous and doesn't cause re-renders.
+    const requestInFlight = useRef(false)
+
+    /** Wraps any async API action with the in-flight lock. */
+    const withLock = useCallback(async (fn) => {
+        if (requestInFlight.current) {
+            console.warn('[WhatsAppPanel] Request already in flight — ignoring duplicate')
+            return
+        }
+        requestInFlight.current = true
+        setLoading(true)
+        setMessage('')
+        try {
+            await fn()
+        } finally {
+            requestInFlight.current = false
+            setLoading(false)
+        }
+    }, [])
+    // ────────────────────────────────────────────────────────────────────────
+
     // Primary source: REST polling. Secondary: WebSocket push.
     const activePairingCode = polledPairingCode || wsPairingCode
 
@@ -79,22 +101,18 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
     const isPairing = waStatus === 'pairing'
     const isDisconnected = waStatus === 'disconnected'
 
-    // Format phone number to exactly +91-XXXXXXXXXX
     const handlePhoneChange = (e) => {
         let val = e.target.value;
         if (!val) {
             setPhoneNumber('');
             return;
         }
-        // Extract digits only
         let digits = val.replace(/\D/g, '');
 
-        // Auto-prefix with 91 if the user starts typing an Indian local number (e.g. 7, 8, 9)
         if (digits.length > 0 && digits.length <= 10 && !digits.startsWith('91')) {
             digits = '91' + digits;
         }
 
-        // Format as +CC-XXXXXXXXXX
         if (digits.length > 2) {
             setPhoneNumber(`+${digits.substring(0, 2)}-${digits.substring(2, 12)}`);
         } else if (digits.length > 0) {
@@ -104,12 +122,9 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
         }
     }
 
-    const handleStart = async () => {
-        setLoading(true)
-        setMessage('')
+    const handleStart = () => withLock(async () => {
         if (!phoneNumber.trim() || phoneNumber.replace(/\D/g, '').length < 10) {
             setMessage('Please enter a valid phone number with your country code (e.g. +917310885365).')
-            setLoading(false)
             return
         }
         try {
@@ -118,13 +133,10 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
             setMessage('Starting... Pairing code will appear shortly.')
         } catch (e) {
             setMessage(e.response?.data?.detail || 'Failed to start agent')
-        } finally {
-            setLoading(false)
         }
-    }
+    })
 
-    const handleStop = async () => {
-        setLoading(true)
+    const handleStop = () => withLock(async () => {
         try {
             await stopWaAgent()
             onStatusChange('disconnected')
@@ -133,30 +145,24 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
             onAnalyticsRefresh?.()
         } catch (e) {
             setMessage(e.response?.data?.detail || 'Failed to stop')
-        } finally {
-            setLoading(false)
         }
-    }
+    })
 
-    const handleRegenerate = async () => {
-        setLoading(true)
-        setMessage('')
+    const handleRegenerate = () => withLock(async () => {
         setPolledPairingCode(null)
-        onClearPairingCode?.() // Ensures the Dashboard's global WebSocket code state is wiped so polling completely resumes
-        // Temporarily pause the poller by shifting status off 'pairing' to avoid a race condition 
-        // where it immediately fetches the dying session's code before the backend wipes it.
+        onClearPairingCode?.()
+        // Temporarily shift status off 'pairing' to pause the poller and
+        // prevent it from fetching the dying session's stale code.
         onStatusChange('regenerating')
         try {
-            await regenerateWaCode()
+            await regenerateWaCode(phoneNumber)
             onStatusChange('pairing')
             setMessage('Generating fresh pairing code...')
         } catch (e) {
             onStatusChange('pairing') // Revert on failure
             setMessage(e.response?.data?.detail || 'Failed to regenerate code')
-        } finally {
-            setLoading(false)
         }
-    }
+    })
 
     return (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -207,7 +213,11 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
                                 />
                             </div>
                             <div className="flex gap-3 flex-wrap mt-2">
-                                <button onClick={handleStart} disabled={loading} className="btn-accent flex items-center gap-2">
+                                <button
+                                    onClick={handleStart}
+                                    disabled={loading || requestInFlight.current}
+                                    className="btn-accent flex items-center gap-2"
+                                >
                                     {loading ? <Loader size={16} className="animate-spin" /> : <Play size={16} />}
                                     Start Agent
                                 </button>
@@ -216,7 +226,11 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
                     )}
                     {(isConnected || isPairing) && (
                         <div className="flex gap-3 flex-wrap">
-                            <button onClick={handleStop} disabled={loading} className="btn-ghost flex items-center gap-2">
+                            <button
+                                onClick={handleStop}
+                                disabled={loading || requestInFlight.current}
+                                className="btn-ghost flex items-center gap-2"
+                            >
                                 {loading ? <Loader size={16} className="animate-spin" /> : <Square size={16} />}
                                 Stop Agent
                             </button>
@@ -258,7 +272,11 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
                             Waiting for you to enter code...
                         </div>
                         <div className="mt-6 flex justify-center border-t border-board-600/50 pt-4">
-                            <button onClick={handleRegenerate} disabled={loading} className="text-xs text-board-accent hover:underline flex items-center gap-1 transition-all">
+                            <button
+                                onClick={handleRegenerate}
+                                disabled={loading || requestInFlight.current}
+                                className="text-xs text-board-accent hover:underline flex items-center gap-1 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
                                 {loading ? <Loader size={12} className="animate-spin" /> : <RefreshCw size={12} />}
                                 Code expired or failed? Generate a new one
                             </button>

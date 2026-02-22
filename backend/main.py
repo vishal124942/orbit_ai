@@ -229,23 +229,28 @@ async def wa_stop(user: Dict = Depends(get_current_user)):
 
 
 @app.post("/api/whatsapp/regenerate")
-async def wa_regenerate(user: Dict = Depends(get_current_user)):
+async def wa_regenerate(req: StartWaRequest = Body(default=None), user: Dict = Depends(get_current_user)):
     """
     Forcefully stops the current agent pairing session and spins it up again 
     to fetch a brand new 8-character code.
     """
     wa_session = await platform_db.get_wa_session(user["id"])
-    phone_number = wa_session.get("wa_number") if wa_session else None
+    
+    # Prioritize the phone number sent from the frontend request, fallback to database 
+    phone_number = (req.phone_number if req and req.phone_number else None) or (wa_session.get("wa_number") if wa_session else None)
     
     if not phone_number:
         raise HTTPException(
             status_code=400, 
-            detail="No phone number bound to this account. Cannot regenerate pairing code."
+            detail="No phone number provided or bound to this account. Cannot regenerate pairing code."
         )
 
     # Clean the phone number of any WhatsApp multi-device suffixes (e.g., :53)
     # Baileys requestPairingCode explicitly requires purely the digits.
     clean_phone = phone_number.split(':')[0]
+    
+    # Ensure it's just pure digits and optionally the + sign
+    clean_phone = '+' + ''.join(filter(str.isdigit, clean_phone))
 
     # 1. Kill the stale background WhatsApp process
     await session_manager.stop_agent(user["id"])

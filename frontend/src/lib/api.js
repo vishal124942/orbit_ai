@@ -71,8 +71,9 @@ export const stopWaAgent = async () => {
     return res.data
 }
 
-export const regenerateWaCode = async () => {
-    const res = await api.post('/api/whatsapp/regenerate')
+export const regenerateWaCode = async (phoneNumber = null) => {
+    const payload = phoneNumber ? { phone_number: phoneNumber } : {}
+    const res = await api.post('/api/whatsapp/regenerate', payload)
     return res.data
 }
 
