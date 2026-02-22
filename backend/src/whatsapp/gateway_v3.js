@@ -386,6 +386,7 @@ async function startGateway() {
         logger,
         // MUST use these specific browser options for Pairing Code to work
         browser: phoneNumber ? ["Mac OS", "Chrome", "121.0.0.0"] : ["Orbit AI", "Desktop", "1.0.0"],
+        printQRInTerminal: false,
         connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: 60000,
         keepAliveIntervalMs: 30000,
