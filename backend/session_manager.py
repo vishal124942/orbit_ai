@@ -111,6 +111,12 @@ class SessionManager:
         if session.wa_status == "connected" and session.is_running:
             return session
 
+        # Kill any existing zombie or stuck process before spawning a new one
+        if session.task or session.controller:
+            logger.info(f"Stopping existing agent process for {user_id} before starting new pairing")
+            await self.stop_agent(user_id)
+            await asyncio.sleep(1)
+
         # Import here to avoid circular deps
         from backend.user_agent import UserAgentController
 
