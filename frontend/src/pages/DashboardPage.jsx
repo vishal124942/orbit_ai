@@ -1,18 +1,16 @@
 import React, { useEffect, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-    LogOut, RefreshCw, Bot, Zap, Users, Settings,
+    LogOut, RefreshCw, Bot, Zap, Users,
     ChevronRight, Activity
 } from 'lucide-react'
 import { useAuthStore, fetchMe, getAnalytics, createWebSocket, startWaAgent } from '../lib/api'
 import WhatsAppPanel from '../components/WhatsAppPanel'
 import ContactsPanel from '../components/ContactsPanel'
-import SettingsPanel from '../components/SettingsPanel'
 
 const TAB_CONFIG = [
     { id: 'whatsapp', label: 'WhatsApp', icon: <Bot size={16} /> },
     { id: 'contacts', label: 'Contacts', icon: <Users size={16} /> },
-    { id: 'settings', label: 'Settings', icon: <Settings size={16} /> },
 ]
 
 export default function DashboardPage() {
@@ -165,9 +163,6 @@ export default function DashboardPage() {
                     )}
                     {activeTab === 'contacts' && (
                         <ContactsPanel waStatus={waStatus} />
-                    )}
-                    {activeTab === 'settings' && (
-                        <SettingsPanel />
                     )}
                 </div>
             </div>

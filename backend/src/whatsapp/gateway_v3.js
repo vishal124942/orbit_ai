@@ -313,7 +313,7 @@ const { useR2AuthState } = require('./r2_auth_state');
 async function startGateway() {
     console.log(JSON.stringify({ type: 'system', message: 'Gateway starting...' }));
 
-    let state, saveCreds;
+    let state, saveCreds, clearStateFunc;
     const sessionName = process.env.WHATSAPP_SESSION_ID || path.basename(AUTH_DIR);
 
     if (process.env.R2_BUCKET_NAME) {
@@ -321,11 +321,20 @@ async function startGateway() {
         const r2Auth = await useR2AuthState(sessionName);
         state = r2Auth.state;
         saveCreds = r2Auth.saveCreds;
+        clearStateFunc = r2Auth.clearState;
     } else {
         console.error(`[Gateway] Using Local File System for Auth State (Dir: ${AUTH_DIR})`);
         const localAuth = await useMultiFileAuthState(AUTH_DIR);
         state = localAuth.state;
         saveCreds = localAuth.saveCreds;
+
+        clearStateFunc = () => {
+            const files = fs.readdirSync(AUTH_DIR);
+            for (const file of files) {
+                fs.unlinkSync(path.join(AUTH_DIR, file));
+            }
+            console.error(`[Gateway] Cleared ${files.length} stale auth files from ${AUTH_DIR}`);
+        }
     }
 
     let version;
@@ -351,18 +360,7 @@ async function startGateway() {
         retryRequestDelayMs: 500
     });
 
-    if (phoneNumber && !state.creds.registered) {
-        setTimeout(async () => {
-            try {
-                let code = await sock.requestPairingCode(phoneNumber);
-                code = code?.match(/.{1,4}/g)?.join('-') || code;
-                console.error(`[Gateway] Pairing code requested: ${code}`);
-                console.log(JSON.stringify({ type: 'pairing_code', code: code }));
-            } catch (err) {
-                console.error("[Gateway] Pairing Code Error:", err);
-            }
-        }, 3000);
-    }
+    // The pairing code is now requested securely during the 'connection.update' event.
 
     sock.ev.on('creds.update', saveCreds);
 
@@ -457,8 +455,23 @@ async function startGateway() {
         debouncedSendContacts();
     });
 
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect } = update;
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        // Request pairing code when socket is initialized and needs auth 
+        // We detect this when Baileys generates a QR code string or asks for one.
+        if (phoneNumber && !state.creds.registered && (qr || update.isNewLogin)) {
+            try {
+                // Wait a tiny bit for the socket to fully stabilize
+                await new Promise(resolve => setTimeout(resolve, 1500));
+                let code = await sock.requestPairingCode(phoneNumber);
+                code = code?.match(/.{1,4}/g)?.join('-') || code;
+                console.error(`[Gateway] Pairing code requested successfully: ${code}`);
+                console.log(JSON.stringify({ type: 'pairing_code', code: code }));
+            } catch (err) {
+                console.error("[Gateway] Pairing Code Request Failed:", err);
+            }
+        }
 
         if (connection) {
             console.log(JSON.stringify({
@@ -498,11 +511,10 @@ async function startGateway() {
                     console.error('[Gateway] Logged out (401). Auto-clearing auth and restarting for fresh session...');
                     // Clear stale auth files so next start requests fresh session
                     try {
-                        const files = fs.readdirSync(AUTH_DIR);
-                        for (const file of files) {
-                            fs.unlinkSync(path.join(AUTH_DIR, file));
+                        if (clearStateFunc) {
+                            await clearStateFunc();
+                            console.error(`[Gateway] Cleared stale auth state for session.`);
                         }
-                        console.error(`[Gateway] Cleared ${files.length} stale auth files from ${AUTH_DIR}`);
                     } catch (e) {
                         console.error(`[Gateway] Auth cleanup error: ${e.message}`);
                     }
@@ -558,7 +570,14 @@ async function startGateway() {
 
         // type=notify: real-time incoming messages — process through full AI pipeline
         if (m.type === 'notify') {
+            const now = Math.floor(Date.now() / 1000);
             for (const msg of m.messages) {
+                // Ignore historical messages emitted during sync (older than 60 seconds)
+                const msgTime = Number(msg.messageTimestamp) || 0;
+                if (now - msgTime > 60) {
+                    continue;
+                }
+
                 // Allow fromMe messages for God Mode and Stop/Start commands
                 const messageType = Object.keys(msg.message || {})[0];
                 let text = msg.message?.conversation ||
@@ -588,6 +607,8 @@ async function startGateway() {
 
                     if (mediaType === 'sticker') {
                         text = text || "[Sticker]";
+                    } else if (mediaType === 'audio' || mediaType === 'voice') {
+                        text = text || "[Voice Note]";
                     } else if (!text && mediaType) {
                         text = `[Sent a ${mediaType}]`;
                     }

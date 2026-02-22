@@ -186,19 +186,24 @@ class MediaProcessor:
                     print(f"[MediaProcessor] Sarvam STT Error: {e}")
 
             # Fallback to OpenAI Whisper
-            print("[MediaProcessor] ⚠️ Falling back to OpenAI Whisper for STT")
+            print("[MediaProcessor] ⚠️ Using OpenAI Whisper for STT")
             with open(converted, "rb") as f:
                 resp = self.client.audio.transcriptions.create(
                     model="whisper-1",
                     file=f,
                     response_format="text",
-                    language="hi",  # hint: Hindi/Hinglish — faster + more accurate
+                    language="hi"  # hint: Hindi/Hinglish — faster + more accurate
                 )
-            return resp.strip()
+            
+            # Whisper with 'response_format="text"' returns a string, not an object
+            return str(resp).strip()
+        except Exception as e:
+            print(f"[MediaProcessor] Whisper STT Error: {e}")
+            return "[Voice note: transcription failed]"
         finally:
             if converted != path and os.path.exists(converted):
                 try:
-                    os.unlink(converted)
+                    os.remove(converted)
                 except Exception:
                     pass
 

@@ -284,6 +284,7 @@ class _IsolatedAgentController:
         self.ORCHESTRATOR_SYSTEM_PROMPT = ORCHESTRATOR_SYSTEM_PROMPT
         self.INTERACTIVE_SYSTEM_PROMPT = INTERACTIVE_SYSTEM_PROMPT
 
+    def _setup_wa(self):
         def on_pairing_code(event):
             self.status["pairing_code"] = event["code"]
             self.status["whatsapp"] = "pairing"
@@ -478,6 +479,7 @@ class _IsolatedAgentController:
                 if self.loop:
                     asyncio.run_coroutine_threadsafe(_generate_souls_bg(), self.loop)
 
+        self.wa_bridge.on_event("pairing_code", on_pairing_code)
         self.wa_bridge.on_event("connection", on_connection)
         self.wa_bridge.on_event("message", on_message)
         self.wa_bridge.on_event("contacts", on_contacts)
@@ -601,7 +603,7 @@ class _IsolatedAgentController:
     async def _schedule_auto_response(self, remote_jid: str):
         import asyncio
         async with self.debounce_lock:
-            debounce = self.config.get("whatsapp", {}).get("debounce_seconds", 8)
+            debounce = self.config.get("whatsapp", {}).get("debounce_seconds", 3)
             if remote_jid in self.debounce_timers:
                 self.debounce_timers[remote_jid].cancel()
             self.debounce_timers[remote_jid] = self.loop.call_later(
@@ -753,12 +755,8 @@ class _IsolatedAgentController:
                     self.db.save_draft(remote_jid, plan.get("reply_text", ""), "", "", "")
                     return
 
-                # Localize
+                # The Orchestrator system prompt handle localization directly now 
                 reply_text = plan.get("reply_text", "")
-                if reply_text and not plan.get("skip_reply"):
-                    reply_text = await self.localizer.localize(
-                        reply_text, analysis.get("vibe", "neutral"), analysis.get("language", "hinglish")
-                    )
 
                 # Media decision + execute
                 response_type = self.media_responder.recommend_response_type(

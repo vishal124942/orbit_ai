@@ -103,11 +103,6 @@ export const getSettings = async () => {
     return res.data
 }
 
-export const updateSettings = async (settings) => {
-    const res = await api.post('/api/settings', settings)
-    return res.data
-}
-
 export const updateAllowlist = async (allowedJids) => {
     const res = await api.post('/api/settings/allowlist', { allowed_jids: allowedJids })
     return res.data

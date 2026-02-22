@@ -303,23 +303,6 @@ async def get_settings(user: Dict = Depends(get_current_user)):
     return {"settings": settings, "allowed_jids": allowed_jids}
 
 
-@app.post("/api/settings")
-async def update_settings(req: AgentSettingsUpdate, user: Dict = Depends(get_current_user)):
-    updates = req.dict(exclude_none=True)
-    if not updates:
-        raise HTTPException(status_code=400, detail="No settings provided")
-    await platform_db.update_agent_settings(user["id"], updates)
-
-    if "soul_override" in updates:
-        s = session_manager.sessions.get(user["id"])
-        if s and s.controller:
-            s.controller.soul_override = updates["soul_override"]
-            if hasattr(s.controller, "_controller") and s.controller._controller:
-                s.controller._controller.sessions.clear()
-
-    return {"message": "Settings saved"}
-
-
 @app.post("/api/settings/allowlist")
 async def update_allowlist(req: AllowlistUpdate, user: Dict = Depends(get_current_user)):
     await platform_db.bulk_update_allowlist(user["id"], req.allowed_jids)
