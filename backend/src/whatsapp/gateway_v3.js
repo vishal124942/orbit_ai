@@ -393,6 +393,7 @@ async function startGateway() {
     });
 
     // The pairing code is now requested securely during the 'connection.update' event.
+    let isPairingCodeRequested = false;
 
     sock.ev.on('creds.update', saveCreds);
 
@@ -492,8 +493,9 @@ async function startGateway() {
 
         // Request pairing code when socket is initialized and needs auth 
         // We detect this when Baileys generates a QR code string or asks for one.
-        if (phoneNumber && !state.creds.registered && (qr || update.isNewLogin)) {
+        if (phoneNumber && !state.creds.registered && (qr || update.isNewLogin) && !isPairingCodeRequested) {
             try {
+                isPairingCodeRequested = true;
                 // Wait a tiny bit for the socket to fully stabilize
                 await new Promise(resolve => setTimeout(resolve, 1500));
                 let code = await sock.requestPairingCode(phoneNumber);
@@ -501,6 +503,7 @@ async function startGateway() {
                 console.error(`[Gateway] Pairing code requested successfully: ${code}`);
                 console.log(JSON.stringify({ type: 'pairing_code', code: code }));
             } catch (err) {
+                isPairingCodeRequested = false; // Reset if it failed
                 console.error("[Gateway] Pairing Code Request Failed:", err);
             }
         }
