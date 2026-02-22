@@ -246,7 +246,7 @@ class SessionManager:
                 ["node", gateway_script, wa_auth_dir, "--clear-state"],
                 env=env,
                 capture_output=True,
-                timeout=10
+                timeout=30
             )
         except Exception as err:
             logger.error(f"[SessionManager] Failed to invoke NodeJS state cleanup: {err}")

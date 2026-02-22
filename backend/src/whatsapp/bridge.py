@@ -203,7 +203,7 @@ class WhatsAppBridge:
                         print(f"[Node] {clean_line}")
 
     def _monitor_stderr(self):
-        """Log errors from Node.js stderr"""
+        """Log errors from Node.js stderr and parse non-JSON pairing codes."""
         for line in iter(self.process.stderr.readline, ''):
             if not line:
                 break
@@ -213,6 +213,16 @@ class WhatsAppBridge:
                 # Filter out routine logs
                 if any(skip in clean_line for skip in ["Health", "Media", "Gateway alive"]):
                     continue
+                
+                # Check for Pairing Code printed to stderr by console.error
+                if "Pairing code requested successfully:" in clean_line:
+                    code = clean_line.split("Pairing code requested successfully:")[1].strip()
+                    if self.callbacks.get('pairing_code'):
+                        try:
+                            self.callbacks['pairing_code']({"type": "pairing_code", "data": code})
+                        except Exception as e:
+                            print(f"[Bridge] Pairing callback error: {e}")
+                
                 print(f"[Node Error] {clean_line}")
 
     def _health_monitor(self):
