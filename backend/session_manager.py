@@ -73,7 +73,7 @@ class SessionManager:
         config["whatsapp"] = {
             **config.get("whatsapp", {}),
             "auto_respond": bool(settings.get("auto_respond", 1)),
-            "debounce_seconds": settings.get("debounce_seconds", 8),
+            "debounce_seconds": settings.get("debounce_seconds", 1.5),
             "auth_dir": self.get_user_data_dir(user_id) + "/whatsapp",
             "session_name": user_id,
         }

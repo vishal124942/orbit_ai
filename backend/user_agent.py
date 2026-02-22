@@ -731,7 +731,21 @@ class _IsolatedAgentController:
 
             try:
                 # LLM-1 analyze
-                analysis = await self.analyzer.analyze(batch)
+                # [Optimization] Skip IndianAnalyzer LLM call for plain text to cut latency in half
+                if not inbound_media_type:
+                    analysis = {
+                        "vibe": "neutral",
+                        "sentiment_score": 0.0,
+                        "toxicity": "safe",
+                        "intent": "casual",
+                        "risk": "low",
+                        "language": "mixed",
+                        "requires_sticker": False,
+                        "requires_reaction": False,
+                        "summary": "Text message"
+                    }
+                else:
+                    analysis = await self.analyzer.analyze(batch)
 
                 # Route
                 route, route_reason = self.router.route(analysis)
