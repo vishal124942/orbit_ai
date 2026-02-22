@@ -50,7 +50,6 @@ if (isClearStateCmd) {
             process.exit(1);
         }
     })();
-    // Stop further execution
     return;
 }
 // ────────────────────────────────────────────────────────────────────────────
@@ -58,39 +57,60 @@ if (isClearStateCmd) {
 console.error(`[Gateway V2.1] Using AUTH_DIR: ${AUTH_DIR}`);
 if (phoneNumber) console.error(`[Gateway V2.1] Using Pairing Code for phone: ${phoneNumber}`);
 
+// ── FIX: Single-run guard ────────────────────────────────────────────────────
+// The old code called startGateway() recursively from inside connection.update.
+// This created multiple concurrent Baileys sockets fighting over the same auth
+// state. We now exit the process instead and let Python's bridge._health_monitor
+// (or _attempt_restart) restart us cleanly as a fresh process.
+//
+// Rule: Node NEVER calls startGateway() more than once per process lifetime.
+// If a reconnect is needed, Node emits { type: "restart_requested" } on stdout
+// and calls process.exit(0).  Python owns the restart lifecycle.
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Emit a restart request to Python and exit this process.
+ * Python's bridge will detect either:
+ *   a) the stdout JSON event "restart_requested", OR
+ *   b) the process dying (poll() !== null) — whichever arrives first.
+ * Either way Python will call _attempt_restart() which calls start().
+ *
+ * @param {string} reason  Human-readable reason for the restart.
+ * @param {number} [delay] Milliseconds to wait before exiting (gives stdout time to flush).
+ */
+function requestRestartAndExit(reason, delay = 500) {
+    console.error(`[Gateway] Requesting restart from Python: ${reason}`);
+    // Emit the event synchronously so Python can log the reason
+    console.log(JSON.stringify({ type: 'restart_requested', reason }));
+    // Give stdout a moment to flush, then exit
+    setTimeout(() => process.exit(0), delay);
+}
+
 // Connection state management
 let sock = null;
 let isConnected = false;
 let messageQueue = [];
 let isProcessingQueue = false;
-let contacts = {}; // Track all seen contacts
+let contacts = {};
 
 let contactsTimeout = null;
 function debouncedSendContacts() {
     if (contactsTimeout) clearTimeout(contactsTimeout);
     contactsTimeout = setTimeout(() => {
         sendContacts();
-    }, 5000); // Wait 5 seconds after last update before sending
+    }, 5000);
 }
-
-// ... (downloadAndSaveMedia implementation remains above) ...
 
 async function sendContacts() {
     const raw = Object.values(contacts);
-    // Accept @s.whatsapp.net (individuals), @g.us (groups), and @lid (linked identity)
     const cleaned = raw.filter(c => {
         if (!c.id) return false;
-        // Skip system/broadcast/newsletter
         if (c.id.includes('status@') || c.id.includes('broadcast') || c.id.includes('newsletter')) return false;
-        // REQUIREMENT: REAL CONTACTS ONLY (individuals only)
         const valid = c.id.endsWith('@s.whatsapp.net') || c.id.endsWith('@lid');
         return valid;
     }).map(c => {
-        // For @lid contacts, try to extract a phone number from the ID
-        // LID format is typically: <number>@lid  
         let phoneJid = c.id;
         if (c.id.endsWith('@lid')) {
-            // Keep the LID as-is but mark it; Python side will handle display
             phoneJid = c.id;
         }
         return {
@@ -102,7 +122,6 @@ async function sendContacts() {
         };
     });
     console.error(`[Gateway] Sending ${cleaned.length} contacts (filtered from ${raw.length})`);
-    // Debug: log a few samples
     cleaned.slice(0, 5).forEach((c, i) => {
         console.error(`[Gateway]   Sample[${i}]: id=${c.id}, name=${c.name || 'NONE'}`);
     });
@@ -112,7 +131,6 @@ async function sendContacts() {
     }));
 }
 
-
 // Ensure directories exist
 [MEDIA_DIR].forEach(dir => {
     if (!fs.existsSync(dir)) {
@@ -120,19 +138,16 @@ async function sendContacts() {
     }
 });
 
-// Calculate file hash for deduplication
 function getFileHash(buffer) {
     return crypto.createHash('sha256').update(buffer).digest('hex');
 }
 
-// Check if media already exists
 function findExistingMedia(hash, extension) {
     const files = fs.readdirSync(MEDIA_DIR);
     const matchingFile = files.find(f => f.startsWith(hash));
     return matchingFile ? path.join(MEDIA_DIR, matchingFile) : null;
 }
 
-// Process message queue with retry logic
 async function processMessageQueue() {
     if (isProcessingQueue || messageQueue.length === 0) return;
 
@@ -151,23 +166,19 @@ async function processMessageQueue() {
             }));
         }
 
-        // Small delay between messages to prevent rate limiting
         await new Promise(r => setTimeout(r, 300));
     }
 
     isProcessingQueue = false;
 }
 
-// Execute a single command with proper error handling
 async function executeCommand(command) {
     const target = formatJid(command.to);
 
-    // Verify connection
     if (!isConnected || !sock || !sock.user) {
         throw new Error('Connection not ready');
     }
 
-    // Send typing indicator
     try {
         await sock.presenceSubscribe(target);
         await sock.sendPresenceUpdate('composing', target);
@@ -190,19 +201,17 @@ async function executeCommand(command) {
                 await sendContacts();
             }
 
-            // Success - send ack
             console.log(JSON.stringify({
                 type: 'ack',
                 id: command.id,
                 success: true
             }));
 
-            // Revoke typing
             try {
                 await sock.sendPresenceUpdate('paused', target);
             } catch (e) { }
 
-            return; // Success!
+            return;
 
         } catch (err) {
             lastError = err;
@@ -216,7 +225,7 @@ async function executeCommand(command) {
                 continue;
             }
 
-            throw err; // Final failure
+            throw err;
         }
     }
 
@@ -225,7 +234,6 @@ async function executeCommand(command) {
     }
 }
 
-// Send a message (text, media, or sticker)
 async function sendMessage(target, command) {
     let options = {};
 
@@ -234,34 +242,28 @@ async function sendMessage(target, command) {
         const isUrl = mediaPath.startsWith('http');
         const ext = path.extname(mediaPath).toLowerCase();
 
-        // Determine media type
         if (ext === '.webp' || command.mediaType === 'sticker') {
-            // Sticker
             options = {
                 sticker: isUrl ? { url: mediaPath } : fs.readFileSync(mediaPath)
             };
         } else if (ext === '.mp4' || ext === '.mkv' || ext === '.avi' || command.mediaType === 'video') {
-            // Video
             options = {
                 video: isUrl ? { url: mediaPath } : fs.readFileSync(mediaPath),
                 caption: command.text || ''
             };
         } else if (ext === '.ogg' || ext === '.mp3' || ext === '.m4a' || ext === '.opus' || command.mediaType === 'audio') {
-            // Audio
             options = {
                 audio: isUrl ? { url: mediaPath } : fs.readFileSync(mediaPath),
                 mimetype: 'audio/mp4',
                 ptt: true
             };
         } else {
-            // Image (default)
             options = {
                 image: isUrl ? { url: mediaPath } : fs.readFileSync(mediaPath),
                 caption: command.text || ''
             };
         }
     } else if (command.text) {
-        // Text only
         options = { text: command.text };
     } else {
         throw new Error('No text or media provided');
@@ -270,7 +272,6 @@ async function sendMessage(target, command) {
     await sock.sendMessage(target, options);
 }
 
-// Send a reaction
 async function sendReaction(target, command) {
     await sock.sendMessage(target, {
         react: {
@@ -284,7 +285,6 @@ async function sendReaction(target, command) {
     });
 }
 
-// Delete a message
 async function deleteMessage(target, command) {
     await sock.sendMessage(target, {
         delete: {
@@ -295,22 +295,18 @@ async function deleteMessage(target, command) {
     });
 }
 
-// Format JID properly
 function formatJid(jid) {
     if (!jid) return jid;
     if (jid.includes('@')) return jid;
     return `${jid.replace(/\D/g, '')}@s.whatsapp.net`;
 }
 
-// Download and save media with deduplication
 async function downloadAndSaveMedia(msg, messageType) {
     try {
         const buffer = await downloadMediaMessage(msg, 'buffer', {});
 
-        // Calculate hash for deduplication
         const hash = getFileHash(buffer);
 
-        // Determine file extension
         const mediaTypeMap = {
             'audio': 'ogg',
             'video': 'mp4',
@@ -320,11 +316,9 @@ async function downloadAndSaveMedia(msg, messageType) {
         const mediaType = messageType.replace('Message', '');
         const extension = mediaTypeMap[mediaType] || 'bin';
 
-        // Check if file already exists
         let mediaPath = findExistingMedia(hash, extension);
 
         if (!mediaPath) {
-            // Save new file with hash-based name
             const fileName = `${hash}.${extension}`;
             mediaPath = path.join(MEDIA_DIR, fileName);
             await writeFile(mediaPath, buffer);
@@ -384,8 +378,7 @@ async function startGateway() {
             keys: makeCacheableSignalKeyStore(state.keys, logger),
         },
         logger,
-        // MUST use these specific browser options for Pairing Code to work
-        browser: phoneNumber ? ["Mac OS", "Chrome", "121.0.0.0"] : ["Orbit AI", "Desktop", "1.0.0"],
+        browser: ["Ubuntu", "Chrome", "20.0.04"],
         printQRInTerminal: false,
         connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: 60000,
@@ -393,7 +386,6 @@ async function startGateway() {
         retryRequestDelayMs: 500
     });
 
-    // The pairing code is now requested securely during the 'connection.update' event.
     let isPairingCodeRequested = false;
 
     sock.ev.on('creds.update', saveCreds);
@@ -405,7 +397,6 @@ async function startGateway() {
         });
         console.error(`[Gateway] contacts.upsert: +${newContacts.length} contacts (Total: ${Object.keys(contacts).length})`);
 
-        // Auto-send update if we already had a connection (dynamic update)
         if (isConnected) {
             debouncedSendContacts();
         }
@@ -415,13 +406,10 @@ async function startGateway() {
         updates.forEach(u => {
             if (!u.id || u.id.includes('broadcast')) return;
             if (contacts[u.id]) {
-                // Only update name if the new update actually HAS a name/notify
-                // This prevents "random number" overrides if we already have a name
                 const hasName = u.name || u.notify || u.pushName;
                 if (!contacts[u.id].name || hasName) {
                     contacts[u.id] = { ...contacts[u.id], ...u };
                 } else {
-                    // Just merge non-name fields
                     const { name, notify, pushName, ...rest } = u;
                     contacts[u.id] = { ...contacts[u.id], ...rest };
                 }
@@ -440,11 +428,9 @@ async function startGateway() {
         });
         console.error(`[Gateway] History sync: captured ${historyContacts.length} contacts (Total: ${Object.keys(contacts).length})`);
 
-        // Also capture message history for AI Auto-Profile
         const MAX_HISTORY_PER_CONTACT = 200;
         const historyMessages = history.messages || [];
         if (historyMessages.length > 0) {
-            // Group by contact JID
             const byContact = {};
             for (const msg of historyMessages) {
                 const jid = msg.key?.remoteJid;
@@ -468,10 +454,8 @@ async function startGateway() {
                 });
             }
 
-            // Cap each contact at MAX_HISTORY_PER_CONTACT most recent
             const capped = [];
             for (const [jid, msgs] of Object.entries(byContact)) {
-                // Sort by timestamp descending, take only the latest
                 msgs.sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0));
                 capped.push(...msgs.slice(0, MAX_HISTORY_PER_CONTACT));
             }
@@ -485,26 +469,22 @@ async function startGateway() {
             }
         }
 
-        // Auto-send contacts after history sync completes
         debouncedSendContacts();
     });
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
-        // Request pairing code when socket is initialized and needs auth 
-        // We detect this when Baileys generates a QR code string or asks for one.
         if (phoneNumber && !state.creds.registered && (qr || update.isNewLogin) && !isPairingCodeRequested) {
             try {
                 isPairingCodeRequested = true;
-                // Wait a tiny bit for the socket to fully stabilize
                 await new Promise(resolve => setTimeout(resolve, 1500));
                 let code = await sock.requestPairingCode(phoneNumber);
                 code = code?.match(/.{1,4}/g)?.join('-') || code;
                 console.error(`[Gateway] Pairing code requested successfully: ${code}`);
                 console.log(JSON.stringify({ type: 'pairing_code', code: code }));
             } catch (err) {
-                isPairingCodeRequested = false; // Reset if it failed
+                isPairingCodeRequested = false;
                 console.error("[Gateway] Pairing Code Request Failed:", err);
             }
         }
@@ -514,8 +494,6 @@ async function startGateway() {
 
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode || lastDisconnect?.error?.code;
-                // If the script intends to auto-restart (like on 401 unauthorized pairing requests), 
-                // fake the status as 'pairing' so Python / React doesn't wildly flicker to 'Offline'
                 if (statusCode === 401 || statusCode !== DisconnectReason.loggedOut) {
                     emitStatus = 'pairing';
                 }
@@ -530,8 +508,8 @@ async function startGateway() {
             if (connection === 'open') {
                 isConnected = true;
                 console.error(`[Gateway] Connection opened successfully. Total contacts cached: ${Object.keys(contacts).length}`);
-                debouncedSendContacts(); // Send initial contacts
-                processMessageQueue(); // Start pumping queued messages
+                debouncedSendContacts();
+                processMessageQueue();
             }
 
             if (connection === 'close') {
@@ -547,16 +525,27 @@ async function startGateway() {
                 }
 
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
                 if (shouldReconnect) {
-                    // If it's a conflict (another session replaced us), wait longer
-                    // to let the competing session die before we reconnect.
+                    // ── FIX: Do NOT call startGateway() here. ──────────────────
+                    // Calling startGateway() recursively creates a second Baileys
+                    // socket inside the same process, fighting the first for the
+                    // same auth state and pairing code slot.
+                    //
+                    // Instead: emit restart_requested and exit cleanly.
+                    // Python's bridge._health_monitor will detect the exit and
+                    // call _attempt_restart(), which spawns a brand-new process.
+                    //
+                    // If it's a conflict (another session), wait slightly longer
+                    // before telling Python we want a restart, so the competing
+                    // session gets a chance to die first.
                     const isConflict = reason && reason.toLowerCase().includes('conflict');
-                    const delay = isConflict ? 30000 : 5000;
-                    console.error(`[Gateway] Reconnecting in ${delay / 1000}s... (${isConflict ? 'conflict — waiting for competing session to close' : 'normal reconnect'})`);
-                    setTimeout(() => startGateway(), delay);
+                    const delay = isConflict ? 5000 : 500;
+                    console.error(`[Gateway] Scheduling restart via Python in ${delay}ms (${isConflict ? 'conflict backoff' : 'normal'})`);
+                    setTimeout(() => requestRestartAndExit(reason, 200), delay);
                 } else {
-                    console.error('[Gateway] Logged out (401). Auto-clearing auth and restarting for fresh session...');
-                    // Clear stale auth files so next start requests fresh session
+                    // Logged out (401): clear auth state and ask Python to restart
+                    console.error('[Gateway] Logged out (401). Clearing auth state and requesting fresh restart from Python...');
                     try {
                         if (clearStateFunc) {
                             await clearStateFunc();
@@ -565,18 +554,16 @@ async function startGateway() {
                     } catch (e) {
                         console.error(`[Gateway] Auth cleanup error: ${e.message}`);
                     }
-                    // Restart gateway — will request fresh session
                     contacts = {};
-                    console.error('[Gateway] Throttling for 10 seconds to prevent WhatsApp API spam ban...');
-                    setTimeout(() => startGateway(), 10000);
+                    // ── FIX: Exit and let Python restart, not setTimeout(startGateway) ──
+                    console.error('[Gateway] Auth cleared. Requesting Python restart after 10s throttle...');
+                    setTimeout(() => requestRestartAndExit('logged_out_401_cleared', 200), 10000);
                 }
             }
         }
     });
 
     sock.ev.on('messages.upsert', async (m) => {
-        // type=append: historical messages from WhatsApp sync (like scrolling up)
-        // Store these quietly for AI Auto-Profile without triggering AI pipeline
         if (m.type === 'append') {
             const MAX_PER_CONTACT = 200;
             const byContact = {};
@@ -616,17 +603,14 @@ async function startGateway() {
             }
         }
 
-        // type=notify: real-time incoming messages — process through full AI pipeline
         if (m.type === 'notify') {
             const now = Math.floor(Date.now() / 1000);
             for (const msg of m.messages) {
-                // Ignore historical messages emitted during sync (older than 60 seconds)
                 const msgTime = Number(msg.messageTimestamp) || 0;
                 if (now - msgTime > 60) {
                     continue;
                 }
 
-                // Allow fromMe messages for God Mode and Stop/Start commands
                 const messageType = Object.keys(msg.message || {})[0];
                 let text = msg.message?.conversation ||
                     msg.message?.extendedTextMessage?.text ||
@@ -634,7 +618,6 @@ async function startGateway() {
                     msg.message?.videoMessage?.caption ||
                     "";
 
-                // Check for remote command (stop/start from own number)
                 if (msg.key.fromMe && text.trim().toLowerCase().match(/^(stop|start)$/)) {
                     console.error(`[Gateway] Detected remote ${text.trim().toLowerCase()} command`);
                     console.log(JSON.stringify({
@@ -647,7 +630,6 @@ async function startGateway() {
                 let mediaPath = null;
                 let mediaType = null;
 
-                // Media Handling with deduplication
                 if (['imageMessage', 'videoMessage', 'audioMessage', 'stickerMessage'].includes(messageType)) {
                     const result = await downloadAndSaveMedia(msg, messageType);
                     mediaPath = result.mediaPath;
@@ -662,7 +644,6 @@ async function startGateway() {
                     }
                 }
 
-                // Update contact name from pushName if missing
                 if (msg.key.remoteJid && msg.pushName && !msg.key.remoteJid.includes('broadcast')) {
                     if (!contacts[msg.key.remoteJid] || !contacts[msg.key.remoteJid].name) {
                         contacts[msg.key.remoteJid] = {
@@ -673,7 +654,6 @@ async function startGateway() {
                     }
                 }
 
-                // Send structured message to Python
                 const messageData = {
                     type: 'message',
                     id: msg.key.id,
@@ -684,7 +664,7 @@ async function startGateway() {
                     mediaType: mediaType,
                     timestamp: msg.messageTimestamp,
                     isGroup: isJidGroup(msg.key.remoteJid),
-                    fromMe: msg.key.fromMe // Pass this flag to Python
+                    fromMe: msg.key.fromMe
                 };
                 console.log(JSON.stringify(messageData));
             }
@@ -694,14 +674,10 @@ async function startGateway() {
     // Buffer for incoming data
     let buffer = '';
 
-    // Handle incoming commands from Python (stdin)
     process.stdin.on('data', async (data) => {
         buffer += data.toString();
 
-        // Process line by line
         const lines = buffer.split('\n');
-
-        // The last part might be incomplete, save it back to buffer
         buffer = lines.pop();
 
         for (const line of lines) {
@@ -710,10 +686,8 @@ async function startGateway() {
             try {
                 const command = JSON.parse(line.trim());
 
-                // Add command to queue
                 messageQueue.push(command);
 
-                // Process queue if connected
                 if (isConnected) {
                     processMessageQueue();
                 }
