@@ -228,6 +228,33 @@ async def wa_stop(user: Dict = Depends(get_current_user)):
     return {"message": "Agent stopped", "status": "disconnected"}
 
 
+@app.post("/api/whatsapp/regenerate")
+async def wa_regenerate(user: Dict = Depends(get_current_user)):
+    """
+    Forcefully stops the current agent pairing session and spins it up again 
+    to fetch a brand new 8-character code.
+    """
+    wa_session = await platform_db.get_wa_session(user["id"])
+    phone_number = wa_session.get("wa_number") if wa_session else None
+    
+    if not phone_number:
+        raise HTTPException(
+            status_code=400, 
+            detail="No phone number bound to this account. Cannot regenerate pairing code."
+        )
+
+    # 1. Kill the stale background WhatsApp process
+    await session_manager.stop_agent(user["id"])
+    
+    # 2. Add a tiny debounce to ensure SQLite ports and files are un-locked
+    import asyncio
+    await asyncio.sleep(1.0)
+    
+    # 3. Spin it back up
+    await session_manager.start_pairing(user["id"], phone_number=phone_number)
+    return {"message": "Agent restarting to generate fresh pairing code.", "status": "pairing"}
+
+
 # ── Contacts ──────────────────────────────────────────────────────────────────
 
 @app.get("/api/contacts")

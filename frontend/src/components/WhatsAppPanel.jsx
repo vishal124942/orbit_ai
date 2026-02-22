@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
-import { Play, Square, Smartphone, CheckCircle, AlertCircle, Loader } from 'lucide-react'
-import { startWaAgent, stopWaAgent, useAuthStore } from '../lib/api'
+import { Play, Square, Smartphone, CheckCircle, AlertCircle, Loader, RefreshCw } from 'lucide-react'
+import { startWaAgent, stopWaAgent, regenerateWaCode, useAuthStore } from '../lib/api'
 import axios from 'axios'
 
 /**
@@ -53,7 +53,7 @@ function usePairingCodePoller(enabled, hasActiveCode, onPairingCode, onConnected
     }, [enabled, hasActiveCode])
 }
 
-export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, onStatusChange, onAnalyticsRefresh }) {
+export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, onStatusChange, onClearPairingCode, onAnalyticsRefresh }) {
     const [loading, setLoading] = useState(false)
     const [message, setMessage] = useState('')
     const [polledPairingCode, setPolledPairingCode] = useState(null)
@@ -133,6 +133,22 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
             onAnalyticsRefresh?.()
         } catch (e) {
             setMessage(e.response?.data?.detail || 'Failed to stop')
+        } finally {
+            setLoading(false)
+        }
+    }
+
+    const handleRegenerate = async () => {
+        setLoading(true)
+        setMessage('')
+        setPolledPairingCode(null)
+        onClearPairingCode?.() // Ensures the Dashboard's global WebSocket code state is wiped so polling completely resumes
+        try {
+            await regenerateWaCode()
+            onStatusChange('pairing')
+            setMessage('Generating fresh pairing code...')
+        } catch (e) {
+            setMessage(e.response?.data?.detail || 'Failed to regenerate code')
         } finally {
             setLoading(false)
         }
@@ -236,6 +252,12 @@ export default function WhatsAppPanel({ waStatus, pairingCode: wsPairingCode, on
                         <div className="flex items-center justify-center gap-2 text-xs text-gray-500 animate-pulse">
                             <Loader size={12} className="animate-spin" />
                             Waiting for you to enter code...
+                        </div>
+                        <div className="mt-6 flex justify-center border-t border-board-600/50 pt-4">
+                            <button onClick={handleRegenerate} disabled={loading} className="text-xs text-board-accent hover:underline flex items-center gap-1 transition-all">
+                                {loading ? <Loader size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+                                Code expired or failed? Generate a new one
+                            </button>
                         </div>
                     </div>
                 )}

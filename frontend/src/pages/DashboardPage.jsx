@@ -155,9 +155,9 @@ export default function DashboardPage() {
                     {activeTab === 'whatsapp' && (
                         <WhatsAppPanel
                             waStatus={waStatus}
-                            qrCode={qrCode}
                             pairingCode={pairingCode}
                             onStatusChange={setWaStatus}
+                            onClearPairingCode={() => setPairingCode(null)}
                             onAnalyticsRefresh={loadAnalytics}
                         />
                     )}
