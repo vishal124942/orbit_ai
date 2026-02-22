@@ -222,6 +222,35 @@ class SessionManager:
             except Exception:
                 pass
 
+        import shutil
+        import os
+        import subprocess
+        
+        # 1. Wipe local WhatsApp credentials cache directory
+        wa_auth_dir = os.path.join(self.get_user_data_dir(user_id), "whatsapp")
+        try:
+            if os.path.exists(wa_auth_dir):
+                shutil.rmtree(wa_auth_dir)
+                logger.info(f"[SessionManager] Wiped local auth directory for user {user_id}")
+        except Exception as err:
+            logger.error(f"[SessionManager] Failed to wipe local auth dir: {err}")
+
+        # 2. Wipe Cloudflare R2 session using the Gateway's CLI utility
+        try:
+            gateway_script = os.path.join(os.getcwd(), "backend", "src", "whatsapp", "gateway_v3.js")
+            env = os.environ.copy()
+            env["WHATSAPP_SESSION_ID"] = user_id
+            
+            logger.info(f"[SessionManager] Invoking NodeJS --clear-state for {user_id}...")
+            subprocess.run(
+                ["node", gateway_script, wa_auth_dir, "--clear-state"],
+                env=env,
+                capture_output=True,
+                timeout=10
+            )
+        except Exception as err:
+            logger.error(f"[SessionManager] Failed to invoke NodeJS state cleanup: {err}")
+
         session.is_running = False
         session.wa_status = "disconnected"
         session.qr_code = None

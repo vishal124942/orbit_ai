@@ -19,9 +19,41 @@ const util = require('util');
 
 // Configuration
 const AUTH_DIR = process.argv[2] || path.join(os.homedir(), '.ai-agent-system', 'credentials', 'whatsapp', 'default');
-const phoneNumber = process.argv[3] ? process.argv[3].replace(/[^0-9]/g, '') : null;
+const phoneNumber = process.argv[3] && process.argv[3] !== '--clear-state' ? process.argv[3].replace(/[^0-9]/g, '') : null;
+const isClearStateCmd = process.argv.includes('--clear-state');
+
 const MEDIA_DIR = path.join(__dirname, '../../../data/media');
 const logger = P({ level: 'silent' });
+
+// ── CLEAR STATE COMMAND (CLI UTILITY) ───────────────────────────────────────
+if (isClearStateCmd) {
+    console.error(`[Gateway Utility] Executing --clear-state for ${AUTH_DIR}`);
+    const sessionName = process.env.WHATSAPP_SESSION_ID || path.basename(AUTH_DIR);
+
+    (async () => {
+        try {
+            if (process.env.R2_BUCKET_NAME) {
+                console.error(`[Gateway Utility] Wiping Cloudflare R2 Session: ${sessionName}`);
+                const { useR2AuthState } = require('./r2_auth_state');
+                const auth = await useR2AuthState(sessionName);
+                if (auth.clearState) await auth.clearState();
+            } else {
+                console.error(`[Gateway Utility] Wiping Local Directory: ${AUTH_DIR}`);
+                if (fs.existsSync(AUTH_DIR)) {
+                    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+                }
+            }
+            console.error(`[Gateway Utility] Cleanup successful. Exiting.`);
+            process.exit(0);
+        } catch (err) {
+            console.error(`[Gateway Utility] Cleanup failed:`, err);
+            process.exit(1);
+        }
+    })();
+    // Stop further execution
+    return;
+}
+// ────────────────────────────────────────────────────────────────────────────
 
 console.error(`[Gateway V2.1] Using AUTH_DIR: ${AUTH_DIR}`);
 if (phoneNumber) console.error(`[Gateway V2.1] Using Pairing Code for phone: ${phoneNumber}`);
