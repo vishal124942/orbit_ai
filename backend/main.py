@@ -1,14 +1,5 @@
 """
-Orbit AI — Multi-Tenant FastAPI Backend v3.1
-
-CHANGES in v3.1:
-1. /api/contacts/sync-status — new endpoint returning live contact count,
-   recently-synced count, and running in-memory tally from the session.
-2. WebSocket: forwards contacts_progress events (gateway live count) to
-   frontend clients so the counter updates in real time without polling.
-3. wa_regenerate: stop + start remain sequenced without nested locks.
-4. get_top_contacts: sqlite3 connection safely opened inside try/finally.
-5. Removed duplicate imports.
+Orbit AI — Multi-Tenant FastAPI Backend
 """
 
 import os
@@ -63,7 +54,7 @@ async def lifespan(app: FastAPI):
     session_manager = SessionManager(platform_db, base_config)
     await session_manager.restore_active_sessions()
     asyncio.create_task(_maintenance_loop())
-    logger.info("🚀 Orbit AI Backend v3.1 ready")
+    logger.info("🚀 Orbit AI Backend ready")
     yield
     await close_pool()
 
@@ -173,7 +164,6 @@ async def get_me(user: Dict = Depends(get_current_user)):
     pause_file = os.path.join(data_dir, "paused.lock")
     is_paused = os.path.exists(pause_file)
 
-    # Include live contact sync count from in-memory session
     session = session_manager.sessions.get(user["id"])
     contact_sync_count = session.contact_sync_count if session else 0
 
@@ -220,7 +210,6 @@ async def wa_start(
 
     phone_number = req.phone_number if req else None
 
-    # Enforce 1 Account = 1 Phone
     if phone_number:
         wa_session = await platform_db.get_wa_session(user["id"])
         if wa_session and wa_session.get("wa_number"):
@@ -245,7 +234,8 @@ async def wa_start(
 
 @app.post("/api/whatsapp/stop")
 async def wa_stop(user: Dict = Depends(get_current_user)):
-    await session_manager.stop_agent(user["id"])
+    # Normal stop should preserve WhatsApp auth state for fast/stable restart.
+    await session_manager.stop_agent(user["id"], clear_auth=False)
     return {"message": "Agent stopped", "status": "disconnected"}
 
 
@@ -254,11 +244,6 @@ async def wa_regenerate(
     req: StartWaRequest = Body(default=None),
     user: Dict = Depends(get_current_user),
 ):
-    """
-    Stop current session and start fresh for a new pairing code.
-    stop_agent and start_pairing each acquire action_lock independently —
-    no nesting means no deadlock.
-    """
     wa_session = await platform_db.get_wa_session(user["id"])
     phone_number = (
         (req.phone_number if req and req.phone_number else None)
@@ -273,7 +258,8 @@ async def wa_regenerate(
 
     clean_phone = '+' + ''.join(filter(str.isdigit, phone_number.split(':')[0]))
 
-    await session_manager.stop_agent(user["id"])
+    # Regenerate requires a hard reset to force a fresh pairing code.
+    await session_manager.stop_agent(user["id"], clear_auth=True)
     await asyncio.sleep(1.0)
     await session_manager.start_pairing(user["id"], phone_number=clean_phone)
     return {"message": "Agent restarting for fresh pairing code.", "status": "pairing"}
@@ -293,18 +279,10 @@ async def get_contacts(
 
 @app.get("/api/contacts/sync-status")
 async def get_contact_sync_status(user: Dict = Depends(get_current_user)):
-    """
-    Returns:
-    - total:            all contacts in DB for this user
-    - recently_synced:  contacts updated in the last 10 minutes
-    - live_count:       in-memory running tally from the active session
-    - is_syncing:       True if an agent session is currently active
-    """
     db_status = await platform_db.get_contact_sync_status(user["id"], minutes=10)
     session = session_manager.sessions.get(user["id"])
     live_count = session.contact_sync_count if session else 0
     is_syncing = bool(session and session.is_running)
-
     return {
         **db_status,
         "live_count": live_count,
@@ -553,41 +531,69 @@ async def get_analytics(user: Dict = Depends(get_current_user)):
 
 @app.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
-    await websocket.accept()
+    # ── Step 1: Accept — can fail if client disconnects during handshake ──────
+    try:
+        await websocket.accept()
+    except Exception as e:
+        logger.warning(f"[WS] Accept failed for {user_id}: {e}")
+        return
+
     session_manager.add_ws_client(user_id, websocket)
 
-    # Send current state on connect
-    status = await session_manager.get_session_status(user_id)
-    await websocket.send_json({"type": "status", **status})
-    if status.get("pairing_code"):
-        await websocket.send_json({"type": "pairing_code", "data": status["pairing_code"]})
-
-    # Send current contact count so UI can show it immediately on reconnect
-    session = session_manager.sessions.get(user_id)
-    if session and session.contact_sync_count > 0:
-        await websocket.send_json({
-            "type": "contacts_progress",
-            "count": session.contact_sync_count,
-        })
-
     try:
+        # ── Step 2: Initial state burst ───────────────────────────────────────
+        #
+        # BUG THAT WAS HERE: These sends happened BEFORE the try/except block.
+        # When the client sends a 1001 "going away" (page refresh, mobile
+        # backgrounding, rapid reconnect after 515 gateway restart), accept()
+        # succeeds but the very first send_json throws WebSocketDisconnect /
+        # ClientDisconnected, which was unhandled and produced the giant ASGI
+        # traceback you saw in the logs.
+        #
+        # FIX: everything after accept() is now inside the try/except.
+
+        status = await session_manager.get_session_status(user_id)
+        await websocket.send_json({"type": "status", **status})
+
+        if status.get("pairing_code"):
+            await websocket.send_json({"type": "pairing_code", "data": status["pairing_code"]})
+
+        session = session_manager.sessions.get(user_id)
+        if session and session.contact_sync_count > 0:
+            await websocket.send_json({
+                "type": "contacts_progress",
+                "count": session.contact_sync_count,
+            })
+
+        # ── Step 3: Main receive loop ─────────────────────────────────────────
         while True:
             try:
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=45)
-                if data == "ping":
-                    await websocket.send_json({"type": "pong"})
-                elif data == "status":
-                    s = await session_manager.get_session_status(user_id)
-                    await websocket.send_json({"type": "status", **s})
-                elif data == "sync_contacts":
-                    # Client can request a manual contact sync via WS
-                    sess = session_manager.sessions.get(user_id)
-                    if sess and sess.controller:
-                        asyncio.create_task(sess.controller._sync_contacts())
-                        await websocket.send_json({"type": "sync_triggered"})
             except asyncio.TimeoutError:
+                # Server-side keepalive — client responds with "ping"
                 await websocket.send_json({"type": "ping"})
-    except (WebSocketDisconnect, Exception):
+                continue
+
+            if data == "ping":
+                await websocket.send_json({"type": "pong"})
+            elif data == "status":
+                s = await session_manager.get_session_status(user_id)
+                await websocket.send_json({"type": "status", **s})
+            elif data == "sync_contacts":
+                sess = session_manager.sessions.get(user_id)
+                if sess and sess.controller:
+                    asyncio.create_task(sess.controller._sync_contacts())
+                    await websocket.send_json({"type": "sync_triggered"})
+
+    except WebSocketDisconnect:
+        pass  # Normal close
+    except Exception as e:
+        # Catches uvicorn's ClientDisconnected, websockets' ConnectionClosedOK,
+        # RuntimeError("Cannot call send after a close message"), etc.
+        # All of these just mean the client left — not a server error.
+        logger.debug(f"[WS] Client gone for {user_id}: {type(e).__name__}")
+    finally:
+        # Always remove — even if an unexpected exception occurred
         session_manager.remove_ws_client(user_id, websocket)
 
 

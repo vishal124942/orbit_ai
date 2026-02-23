@@ -119,7 +119,7 @@ class SessionManager:
 
             if session.task or session.controller:
                 logger.info(f"[SessionManager] Stopping existing agent for {user_id} before re-pairing")
-                await self._stop_agent_internal(user_id, session)
+                await self._stop_agent_internal(user_id, session, clear_auth=False)
                 await asyncio.sleep(0.5)
 
             from backend.user_agent import UserAgentController
@@ -129,6 +129,7 @@ class SessionManager:
                 config["whatsapp"]["phone_number"] = phone_number
 
             allowed_jids = set(await self.platform_db.get_allowed_jids(user_id))
+            session.allowed_jids = allowed_jids
             session.contact_sync_count = 0  # Reset counter on new pairing
 
             controller = UserAgentController(
@@ -261,7 +262,7 @@ class SessionManager:
 
     # ── Stop ──────────────────────────────────────────────────────────────────
 
-    async def stop_agent(self, user_id: str):
+    async def stop_agent(self, user_id: str, clear_auth: bool = False):
         """
         Stop a user's agent. Acquires action_lock independently.
 
@@ -270,14 +271,20 @@ class SessionManager:
         """
         session = self.sessions.get(user_id)
         if not session:
-            return
+            # For code regeneration we may still need to wipe persisted WA auth
+            # even when no controller is currently running in memory.
+            if not clear_auth:
+                await self.platform_db.set_agent_running(user_id, False)
+                await self.platform_db.update_wa_status(user_id, "disconnected")
+                return
+            session = await self.get_or_create_session(user_id)
         if session.action_lock is None:
             session.action_lock = asyncio.Lock()
 
         async with session.action_lock:
-            await self._stop_agent_internal(user_id, session)
+            await self._stop_agent_internal(user_id, session, clear_auth=clear_auth)
 
-    async def _stop_agent_internal(self, user_id: str, session: UserSession):
+    async def _stop_agent_internal(self, user_id: str, session: UserSession, clear_auth: bool = False):
         """Lock-free internal shutdown — caller must hold action_lock."""
 
         # 1. Cancel the asyncio task
@@ -297,37 +304,38 @@ class SessionManager:
                 logger.warning(f"[SessionManager] Controller stop error for {user_id}: {e}")
         session.controller = None
 
-        # 3. Wipe local WhatsApp auth cache
+        # 3. Optionally wipe local + remote WhatsApp auth cache (hard reset only)
         wa_auth_dir = os.path.join(self.get_user_data_dir(user_id), "whatsapp")
-        try:
-            import shutil
-            if os.path.exists(wa_auth_dir):
-                shutil.rmtree(wa_auth_dir)
-                logger.info(f"[SessionManager] Wiped local auth dir for {user_id}")
-        except Exception as e:
-            logger.error(f"[SessionManager] Failed to wipe local auth dir: {e}")
+        if clear_auth:
+            try:
+                import shutil
+                if os.path.exists(wa_auth_dir):
+                    await asyncio.to_thread(shutil.rmtree, wa_auth_dir)
+                    logger.info(f"[SessionManager] Wiped local auth dir for {user_id}")
+            except Exception as e:
+                logger.error(f"[SessionManager] Failed to wipe local auth dir: {e}")
 
-        # 4. Wipe Cloudflare R2 session — non-blocking async subprocess
-        try:
-            gateway_script = os.path.join(
-                os.getcwd(), "backend", "src", "whatsapp", "gateway_v3.js"
-            )
-            if os.path.exists(gateway_script):
-                env = os.environ.copy()
-                env["WHATSAPP_SESSION_ID"] = user_id
-                proc = await asyncio.create_subprocess_exec(
-                    "node", gateway_script, wa_auth_dir, "--clear-state",
-                    env=env,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
+            # 4. Wipe Cloudflare R2 session — async subprocess with bounded wait
+            try:
+                gateway_script = os.path.join(
+                    os.getcwd(), "backend", "src", "whatsapp", "gateway_v3.js"
                 )
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=15)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    logger.warning(f"[SessionManager] R2 clear-state timed out for {user_id}")
-        except Exception as e:
-            logger.error(f"[SessionManager] R2 state cleanup failed for {user_id}: {e}")
+                if os.path.exists(gateway_script):
+                    env = os.environ.copy()
+                    env["WHATSAPP_SESSION_ID"] = user_id
+                    proc = await asyncio.create_subprocess_exec(
+                        "node", gateway_script, wa_auth_dir, "--clear-state",
+                        env=env,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=8)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        logger.warning(f"[SessionManager] R2 clear-state timed out for {user_id}")
+            except Exception as e:
+                logger.error(f"[SessionManager] R2 state cleanup failed for {user_id}: {e}")
 
         # 5. Update in-memory + DB state
         session.is_running = False
@@ -352,7 +360,17 @@ class SessionManager:
 
     def add_ws_client(self, user_id: str, ws):
         session = self.sessions.get(user_id)
-        if session and ws not in session.ws_clients:
+        if not session:
+            # New users often open the dashboard WS before starting an agent.
+            # Create a lightweight placeholder session so pairing/status events
+            # can be pushed immediately after start_pairing().
+            session = UserSession(
+                user_id=user_id,
+                data_dir=self.get_user_data_dir(user_id),
+                action_lock=asyncio.Lock(),
+            )
+            self.sessions[user_id] = session
+        if ws not in session.ws_clients:
             session.ws_clients.append(ws)
 
     def remove_ws_client(self, user_id: str, ws):
@@ -361,18 +379,26 @@ class SessionManager:
             session.ws_clients.remove(ws)
 
     async def _broadcast(self, user_id: str, message: Dict):
+        """
+        Broadcast a message to all WebSocket clients for a user.
+        Dead sockets are pruned silently — send errors are never propagated.
+        """
         session = self.sessions.get(user_id)
-        if not session:
+        if not session or not session.ws_clients:
             return
         dead = []
         for ws in list(session.ws_clients):
             try:
                 await ws.send_json(message)
             except Exception:
+                # Catches WebSocketDisconnect, ClientDisconnected, RuntimeError, OSError etc.
+                # Any send failure means the socket is dead — schedule for removal.
                 dead.append(ws)
         for ws in dead:
-            if ws in session.ws_clients:
+            try:
                 session.ws_clients.remove(ws)
+            except ValueError:
+                pass  # Already removed by another coroutine
 
     # ── Status ────────────────────────────────────────────────────────────────
 

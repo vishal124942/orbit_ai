@@ -1,24 +1,15 @@
 """
 Platform Database — PostgreSQL
-================================
-Replaces the SQLite platform.db with PostgreSQL for production scalability.
-Uses asyncpg for async connection pooling — handles 10-100+ concurrent users efficiently.
 
 FIXES applied:
 1. upsert_contacts: derive `number` from the JID for @s.whatsapp.net contacts when
-   no explicit number is supplied, so the column is never NULL for real phone numbers.
-2. get_contacts: relax the display-name filter so contacts that have a non-empty
-   `number` are also included — prevents @lid contacts and unsaved numbers from being
-   silently dropped when they have no human-readable name yet.
-3. upsert_contacts (CAUSE 3 FIX): The original executemany wrapped everything in one
-   transaction, so a single bad row (constraint violation, encoding error, etc.) rolled
-   back ALL contacts in the batch.  Now we split into a fast-path bulk attempt with a
-   per-contact fallback loop, so one bad contact never drops the rest.
-4. upsert_contacts: added detailed logging so we can see exactly how many contacts
-   were stored vs. received, making future debugging much easier.
-5. get_contacts: removed the hard is_group=False default so callers that pass
-   is_group=None get ALL contacts (both individual and group) — used by the
-   contacts page which wants to show everything.
+   no explicit number is supplied.
+2. get_contacts: relaxed filter so contacts with only a number are also shown.
+3. upsert_contacts: two-pass bulk+per-row fallback so one bad row never drops the batch.
+4. upsert_contacts: detailed logging.
+5. get_contacts: is_group=None default returns ALL contacts.
+6. prune_old_media_cache: FIXED SQL bug — asyncpg cannot interpolate $1 inside a
+   string literal like INTERVAL '$1 days'. Changed to ($1 || ' days')::INTERVAL.
 """
 
 import os
@@ -28,12 +19,10 @@ import asyncpg
 from typing import Optional, List, Dict, Any
 from dotenv import load_dotenv
 
-# Load .env from backend directory
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://orbit:orbit@localhost:5432/orbit")
 
-# Global pool — shared across all requests
 _pool: Optional[asyncpg.Pool] = None
 
 
@@ -96,6 +85,7 @@ CREATE TABLE IF NOT EXISTS contacts (
 
 CREATE INDEX IF NOT EXISTS idx_contacts_user ON contacts(user_id);
 CREATE INDEX IF NOT EXISTS idx_contacts_search ON contacts(user_id, name, number);
+CREATE INDEX IF NOT EXISTS idx_contacts_synced ON contacts(user_id, synced_at);
 
 CREATE TABLE IF NOT EXISTS contact_settings (
     id SERIAL PRIMARY KEY,
@@ -146,7 +136,6 @@ CREATE TABLE IF NOT EXISTS media_descriptions (
 
 
 async def init_schema():
-    """Initialize the database schema. Safe to call multiple times."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(SCHEMA_SQL)
@@ -155,12 +144,6 @@ async def init_schema():
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _derive_number_from_jid(jid: str) -> str:
-    """
-    Extract a formatted phone number string from a @s.whatsapp.net JID.
-
-    Returns an empty string for @lid JIDs or any JID whose local part is not
-    purely numeric (group IDs, broadcast, etc.).
-    """
     if not jid or not jid.endswith("@s.whatsapp.net"):
         return ""
     raw = jid.split("@")[0]
@@ -174,7 +157,6 @@ def _derive_number_from_jid(jid: str) -> str:
 import logging
 _logger = logging.getLogger(__name__)
 
-# ── The single-row upsert SQL (reused in both bulk and per-row paths) ─────────
 _CONTACT_UPSERT_SQL = """
     INSERT INTO contacts (user_id, jid, name, number, is_group)
     VALUES ($1, $2, $3, $4, $5)
@@ -195,14 +177,7 @@ _CONTACT_UPSERT_SQL = """
 """
 
 
-# ── PlatformDB class ──────────────────────────────────────────────────────────
-
 class PlatformDB:
-    """
-    Async PostgreSQL-backed platform database.
-    Drop-in replacement for the SQLite version but fully async.
-    """
-
     def __init__(self):
         self._init_done = False
 
@@ -293,35 +268,17 @@ class PlatformDB:
     # ── Contacts ──────────────────────────────────────────────────────────────
 
     async def upsert_contacts(self, user_id: str, contacts: List[Dict]):
-        """
-        Upsert a batch of contacts for a user.
-
-        FIX (CAUSE 3): The original code used executemany inside a single
-        transaction.  One malformed row (encoding error, constraint violation,
-        unexpected NULL in a NOT NULL column, etc.) rolled back the ENTIRE batch.
-        The symptom: 0 contacts stored even though 200+ were received, with a
-        cryptic asyncpg error buried in the logs (if logging was even wired up).
-
-        New strategy — two-pass with per-contact fallback:
-          Pass 1: Try executemany in a savepoint.  Fast for clean batches.
-          Pass 2: If Pass 1 fails, iterate one-by-one and skip individual bad rows.
-
-        This guarantees that at least the good contacts are always stored, even
-        when the batch contains a handful of problematic entries.
-        """
         if not contacts:
             return
 
-        # Normalise data — derive number from JID if caller didn't set it
         data = []
         for c in contacts:
             jid = c.get("jid", "")
             if not jid:
-                continue  # Skip contacts without a JID — can't store them
+                continue
             explicit_number = c.get("number") or ""
             number = explicit_number or _derive_number_from_jid(jid) or None
             name = c.get("name") or None
-
             data.append((
                 user_id,
                 jid,
@@ -335,7 +292,7 @@ class PlatformDB:
 
         pool = await self._pool()
 
-        # ── Pass 1: Bulk fast path ─────────────────────────────────────────────
+        # Pass 1: Bulk fast path
         try:
             async with pool.acquire() as conn:
                 async with conn.transaction():
@@ -350,11 +307,7 @@ class PlatformDB:
                 f"({len(data)} rows): {bulk_err} — falling back to per-row mode"
             )
 
-        # ── Pass 2: Per-row fallback — never drops the whole batch ────────────
-        #
-        # WHY: If one contact has an encoding issue or triggers a constraint,
-        # the bulk INSERT rolls back everything.  By retrying one row at a time
-        # we guarantee the good contacts are stored even when a few are broken.
+        # Pass 2: Per-row fallback — never drops the whole batch
         succeeded = 0
         failed = 0
         async with pool.acquire() as conn:
@@ -376,20 +329,6 @@ class PlatformDB:
 
     async def get_contacts(self, user_id: str, search: str = None,
                            is_group: Optional[bool] = None) -> List[Dict]:
-        """
-        Get contacts for a user.
-
-        Visibility rule:
-          A contact row is shown if ANY of the following is true:
-            • It has a non-empty human-readable name   (saved contact)
-            • It has a non-empty number                (unsaved number-only contact)
-            • It has an entry in contact_settings      (explicitly configured by user)
-
-        FIX: is_group default changed from False to None so calling
-        get_contacts(user_id) without the flag returns ALL contacts
-        (individuals + groups), which is what the contacts page needs.
-        Pass is_group=False explicitly when you only want individuals.
-        """
         pool = await self._pool()
         async with pool.acquire() as conn:
             query = """
@@ -407,7 +346,6 @@ class PlatformDB:
                 params.append(is_group)
                 query += f" AND c.is_group = ${len(params)}"
 
-            # Show contact if it has ANY useful display information
             query += """
                 AND (
                     (c.name   IS NOT NULL AND c.name   != '')
@@ -424,6 +362,24 @@ class PlatformDB:
             query += " ORDER BY c.name ASC NULLS LAST"
             rows = await conn.fetch(query, *params)
             return [dict(r) for r in rows]
+
+    async def get_contact_sync_status(self, user_id: str, minutes: int = 10) -> Dict:
+        pool = await self._pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (
+                        WHERE synced_at > NOW() - ($2 || ' minutes')::INTERVAL
+                    ) AS recent
+                FROM contacts
+                WHERE user_id = $1
+            """, user_id, str(minutes))
+            return {
+                "total": row["total"] if row else 0,
+                "recent_window_minutes": minutes,
+                "recently_synced": row["recent"] if row else 0,
+            }
 
     # ── Contact Settings (Allowlist) ──────────────────────────────────────────
 
@@ -443,7 +399,6 @@ class PlatformDB:
             """, user_id, contact_jid, is_allowed, custom_tone, custom_language)
 
     async def bulk_update_allowlist(self, user_id: str, allowed_jids: List[str]):
-        """Atomically replace the entire allowlist."""
         pool = await self._pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
@@ -550,21 +505,24 @@ class PlatformDB:
     async def prune_old_media_cache(self, keep_days: int = 30):
         pool = await self._pool()
         async with pool.acquire() as conn:
+            # BUG FIX: The original query was:
+            #   WHERE last_accessed < NOW() - INTERVAL '$1 days'
+            # asyncpg does NOT interpolate $1 inside a SQL string literal.
+            # The '$1' was treated as the literal text "$1 days", making the
+            # INTERVAL invalid and crashing the maintenance loop every 24h.
+            # Fix: cast the parameter as an interval using string concatenation.
             deleted = await conn.execute("""
                 DELETE FROM media_descriptions
-                WHERE last_accessed < NOW() - INTERVAL '$1 days'
+                WHERE last_accessed < NOW() - ($1 || ' days')::INTERVAL
                 AND access_count < 3
-            """, keep_days)
+            """, str(keep_days))
             return deleted
 
 
-# ── Sync wrapper for compatibility with non-async code ────────────────────────
+# ── Sync wrapper ──────────────────────────────────────────────────────────────
 
 class SyncPlatformDB:
-    """
-    Synchronous wrapper around PlatformDB for places where async isn't available.
-    Creates its own event loop. Use sparingly — prefer async version.
-    """
+    """Synchronous wrapper. Use sparingly — prefer the async version."""
     def __init__(self):
         self._async_db = PlatformDB()
 
@@ -574,8 +532,7 @@ class SyncPlatformDB:
             if loop.is_running():
                 import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor() as pool:
-                    future = pool.submit(asyncio.run, coro)
-                    return future.result()
+                    return pool.submit(asyncio.run, coro).result()
             return loop.run_until_complete(coro)
         except RuntimeError:
             return asyncio.run(coro)

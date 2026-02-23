@@ -19,11 +19,18 @@ class WhatsAppBridge:
         self.gateway_script = os.path.join(os.path.dirname(__file__), 'gateway_v3.js')
         self.process: Optional[subprocess.Popen] = None
         self.event_queue = queue.Queue()
+
+        # BUG FIX: 'contact_sync_progress' was missing from this dict.
+        # When the gateway emits {"type": "contact_sync_progress", "count": N},
+        # _monitor_stdout checks `event_type in self.callbacks` — since it was
+        # not registered, the event fell into the dead event_queue that nobody
+        # reads. The live contact counter in the frontend never updated.
         self.callbacks = {
             'pairing_code': None,
             'connection': None,
             'message': None,
             'contacts': None,
+            'contact_sync_progress': None,   # ← was missing
             'history_messages': None,
             'agent_control': None,
             'error': None,
@@ -32,28 +39,12 @@ class WhatsAppBridge:
         }
         self.is_running = False
 
-        # ── Intentional-stop flag ────────────────────────────────────────────
-        # Set BEFORE killing the process so _health_monitor does not treat the
-        # death as an unexpected crash and attempt a restart.
         self._intentional_stop = threading.Event()
-
-        # ── Restart-in-progress lock ──────────────────────────────────────────
-        # Prevents _health_monitor and _monitor_stdout from both triggering
-        # _attempt_restart simultaneously (double-restart bug).
         self._restart_in_progress = threading.Event()
 
-        # ── Send queue for non-blocking bridge writes ─────────────────────────
-        # FIX (critical): bridge.send_message/react/delete are called directly
-        # from async coroutines running on the asyncio event loop.  The original
-        # code called time.sleep(5) inside _attempt_restart from the BrokenPipe
-        # error path — this blocked the entire event loop.
-        #
-        # Solution: writes go onto a thread-safe queue. A dedicated daemon
-        # thread drains the queue so the event loop thread never blocks.
         self._send_queue: queue.Queue = queue.Queue()
         self._send_thread: Optional[threading.Thread] = None
 
-        # Monitor threads — tracked so stop() can join them
         self._monitor_threads: list = []
 
         self.reconnect_attempts = 0
@@ -65,13 +56,11 @@ class WhatsAppBridge:
         self.callbacks[event_type] = callback
 
     def start(self):
-        # If already running, don't start another one
         if self.process and self.process.poll() is None:
             print("[Bridge] start() called but gateway is already running")
             return
-            
-        self.is_running = True
 
+        self.is_running = True
         self._intentional_stop.clear()
 
         try:
@@ -106,11 +95,6 @@ class WhatsAppBridge:
             self.is_running = True
             self.reconnect_attempts = 0
 
-            # Drain the send queue (carries over from before restart)
-            # Don't clear it — queued messages should still be delivered
-            # after a restart once the socket reconnects.
-
-            # Start the send drain thread
             self._send_thread = threading.Thread(
                 target=self._drain_send_queue, daemon=True, name="wa-send"
             )
@@ -133,7 +117,7 @@ class WhatsAppBridge:
 
     def stop(self):
         """
-        Stop the gateway.  Sets _intentional_stop BEFORE killing the process
+        Stop the gateway. Sets _intentional_stop BEFORE killing the process
         so _health_monitor never tries to restart after an explicit stop.
         """
         self._intentional_stop.set()
@@ -143,11 +127,14 @@ class WhatsAppBridge:
         if self.process:
             try:
                 self.process.terminate()
-                self.process.wait(timeout=5)
+                self.process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 print("⚠️  Bridge: process didn't terminate — killing forcefully")
                 self.process.kill()
-                self.process.wait()
+                try:
+                    self.process.wait(timeout=2)  # bounded so we never hang
+                except subprocess.TimeoutExpired:
+                    print("⚠️  Bridge: kill wait timed out — abandoning process")
             except Exception:
                 pass
             finally:
@@ -164,14 +151,6 @@ class WhatsAppBridge:
     # ── Send helpers ──────────────────────────────────────────────────────────
 
     def _enqueue(self, command: dict):
-        """
-        Push a command onto the non-blocking send queue.
-
-        FIX: The old code wrote directly to process.stdin inside the async
-        event loop, and on BrokenPipeError called time.sleep(5) which froze
-        the event loop.  Now all writes happen on the _drain_send_queue thread.
-        Callers on the event loop just enqueue and return instantly.
-        """
         if not self.is_running:
             raise RuntimeError("Gateway not running")
         self._send_queue.put(command)
@@ -180,31 +159,25 @@ class WhatsAppBridge:
         """Background thread: drain _send_queue and write to Node stdin."""
         while True:
             item = self._send_queue.get()
-            if item is None:  # Sentinel — stop the thread
+            if item is None:
                 break
             if self._intentional_stop.is_set():
                 break
-            # Wait until the process is alive and stdin is writable
             if not self.process or not self.is_running:
                 continue
             try:
                 self.process.stdin.write(json.dumps(item) + '\n')
                 self.process.stdin.flush()
             except BrokenPipeError:
-                # Process died — _health_monitor or _monitor_stdout will handle restart.
-                # Don't sleep here: just stop draining.  The command is lost but
-                # the restart will bring a fresh session.
                 print("[Bridge] Send queue: broken pipe — waiting for restart")
-                # Signal that restart is needed if not already in progress
                 if not self._intentional_stop.is_set() and not self._restart_in_progress.is_set():
                     self._restart_in_progress.set()
                     threading.Thread(
                         target=self._attempt_restart, daemon=True, name="wa-restart"
                     ).start()
-                # Pause sending until the process comes back
                 while self.is_running and not self._intentional_stop.is_set():
                     if self.process and self.process.poll() is None:
-                        break  # Process is alive again — resume
+                        break
                     time.sleep(0.5)
             except Exception as e:
                 print(f"[Bridge] Send error: {e}")
@@ -250,10 +223,8 @@ class WhatsAppBridge:
     def _monitor_stdout(self):
         """
         Listen for JSON events from Node stdout.
-
-        FIX: When readline() returns '' the process has died.  We now trigger
-        a restart immediately rather than waiting up to 30 s for _health_monitor
-        to notice.
+        Triggers restart immediately when stdout closes rather than waiting
+        for the health monitor's 30s cycle.
         """
         for line in iter(self.process.stdout.readline, ''):
             if not line:
@@ -302,8 +273,7 @@ class WhatsAppBridge:
                 ):
                     print(f"[Node] {clean}")
 
-        # ── stdout EOF: process died ──────────────────────────────────────────
-        # FIX: trigger restart immediately instead of waiting for _health_monitor
+        # stdout EOF — process died
         if not self._intentional_stop.is_set() and not self._restart_in_progress.is_set():
             self._restart_in_progress.set()
             print("[Bridge] stdout closed — process died, triggering restart")
@@ -337,13 +307,10 @@ class WhatsAppBridge:
         """
         Secondary watchdog — catches cases where stdout/stderr close without
         emitting restart_requested (e.g. OOM kill, SIGKILL from OS).
-
-        FIX: Snapshots self.process at the start of each 30 s cycle.  If the
-        process object changed (because _attempt_restart already ran), the old
-        snapshot no longer matches and we skip the cycle — no double restart.
+        Snapshots self.process each cycle to avoid double-restart with _monitor_stdout.
         """
         while self.is_running and not self._intentional_stop.is_set():
-            watched_process = self.process  # Snapshot
+            watched_process = self.process
 
             for _ in range(30):
                 if not self.is_running or self._intentional_stop.is_set():
@@ -353,7 +320,6 @@ class WhatsAppBridge:
             if self._intentional_stop.is_set():
                 return
 
-            # If the process object was replaced (restart happened), loop again
             if self.process is not watched_process:
                 continue
 
@@ -374,9 +340,8 @@ class WhatsAppBridge:
     def _attempt_restart(self):
         """
         Restart the gateway after a delay.
-
-        FIX: All time.sleep calls happen on this dedicated restart thread, NOT
-        on the asyncio event loop thread — eliminating the event loop blockage.
+        All time.sleep calls happen on this dedicated thread, NOT the asyncio
+        event loop — no event loop blockage.
         """
         if self._intentional_stop.is_set():
             print("[Bridge] Restart suppressed — stop was intentional")
@@ -391,7 +356,6 @@ class WhatsAppBridge:
         self.reconnect_attempts += 1
         print(f"🔄 Attempting restart ({self.reconnect_attempts}/{self.max_reconnect_attempts})...")
 
-        # Backoff — safe here because we're on a daemon thread, not the event loop
         time.sleep(5)
 
         if self._intentional_stop.is_set():
@@ -404,13 +368,13 @@ class WhatsAppBridge:
             try:
                 self.process.kill()
                 self.process.wait(timeout=2)
-            except:
+            except Exception:
                 pass
             finally:
                 self.process = None
 
         self.start()
-        self._restart_in_progress.clear()  # Clear AFTER start() so new monitor can set it
+        self._restart_in_progress.clear()
 
     def get_status(self):
         return {

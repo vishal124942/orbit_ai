@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { Play, Square, Smartphone, CheckCircle, AlertCircle, Loader, RefreshCw, Users } from 'lucide-react'
-import { startWaAgent, stopWaAgent, regenerateWaCode, useAuthStore } from '../lib/api'
-import axios from 'axios'
+import api, { startWaAgent, stopWaAgent, regenerateWaCode } from '../lib/api'
 
 /**
  * Pairing Code Poller — REST polling as primary delivery mechanism.
@@ -24,11 +23,7 @@ function usePairingCodePoller(enabled, hasActiveCode, onPairingCode, onConnected
 
         const poll = async () => {
             try {
-                const token = useAuthStore.getState().token
-                const res = await axios.get('/api/whatsapp/pairing-code', {
-                    headers: { Authorization: `Bearer ${token}` },
-                    timeout: 5000,
-                })
+                const res = await api.get('/api/whatsapp/pairing-code', { timeout: 5000 })
                 if (res.data.has_pairing_code) {
                     onPairingCodeRef.current(res.data.pairing_code)
                     if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null }
@@ -63,11 +58,7 @@ function ContactSyncBadge({ isVisible, wsContactCount, userId }) {
         if (!isVisible || !userId) return
         const fetchStatus = async () => {
             try {
-                const token = useAuthStore.getState().token
-                const res = await axios.get('/api/contacts/sync-status', {
-                    headers: { Authorization: `Bearer ${token}` },
-                    timeout: 4000,
-                })
+                const res = await api.get('/api/contacts/sync-status', { timeout: 4000 })
                 const { total, recently_synced, live_count } = res.data
                 setCount(c => Math.max(c, live_count || 0, total || 0))
                 setRecentlySynced(recently_synced || 0)
