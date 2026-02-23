@@ -64,6 +64,7 @@ let contacts = {};            // jid → contact object (in-memory cache)
 let contactsDebounceTimer = null;
 let periodicSyncTimer = null;
 let contactSyncTotal = 0;    // running count for progress events
+let shuttingDown = false;    // set by SIGTERM/SIGINT to suppress restart_requested
 
 // ── Restart helper ─────────────────────────────────────────────────────────────
 function requestRestartAndExit(reason, delay = 500) {
@@ -596,6 +597,12 @@ async function startGateway() {
                 console.error(`[Gateway] Connection closed (Status: ${statusCode}), Error: ${reason}`);
                 console.error(`[Gateway] Update: ${util.inspect(update, { depth: null, colors: false })}`);
 
+                // If we're shutting down (SIGTERM/SIGINT), do NOT request restart
+                if (shuttingDown) {
+                    console.error('[Gateway] Connection closed during shutdown — NOT requesting restart');
+                    return;
+                }
+
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
                 if (shouldReconnect) {
                     const isConflict = reason?.toLowerCase().includes('conflict');
@@ -729,15 +736,17 @@ async function startGateway() {
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
 process.on('SIGINT', () => {
     console.error('[Gateway] Received SIGINT. Shutting down...');
+    shuttingDown = true;
     stopPeriodicContactSync();
     if (sock) sock.end();
-    process.exit(0);
+    setTimeout(() => process.exit(0), 500);
 });
 process.on('SIGTERM', () => {
     console.error('[Gateway] Received SIGTERM. Shutting down...');
+    shuttingDown = true;
     stopPeriodicContactSync();
     if (sock) sock.end();
-    process.exit(0);
+    setTimeout(() => process.exit(0), 500);
 });
 
 startGateway().catch(err => {

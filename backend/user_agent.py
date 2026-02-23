@@ -142,7 +142,9 @@ class UserAgentController:
     async def stop(self):
         if self._controller and hasattr(self._controller, "wa_bridge"):
             try:
-                self._controller.wa_bridge.stop()
+                # wa_bridge.stop() performs subprocess waits/thread joins and can
+                # block for seconds; run it off the event loop.
+                await asyncio.to_thread(self._controller.wa_bridge.stop)
             except Exception as e:
                 logger.warning(f"[UserAgent:{self.user_id}] Stop error: {e}")
 
