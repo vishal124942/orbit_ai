@@ -94,7 +94,9 @@ class WhatsAppBridge:
                 env=env,
             )
             self.is_running = True
-            self.reconnect_attempts = 0
+            # NOTE: reconnect_attempts is NOT reset here — it accumulates across
+            # _attempt_restart calls so the max_reconnect_attempts limit works.
+            # It's reset only when a connection actually succeeds (on_connection open).
 
             self._send_thread = threading.Thread(
                 target=self._drain_send_queue, daemon=True, name="wa-send"

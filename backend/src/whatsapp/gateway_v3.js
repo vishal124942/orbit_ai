@@ -595,11 +595,23 @@ async function startGateway() {
                 const reason = error?.message || 'Unknown';
 
                 console.error(`[Gateway] Connection closed (Status: ${statusCode}), Error: ${reason}`);
-                console.error(`[Gateway] Update: ${util.inspect(update, { depth: null, colors: false })}`);
 
                 // If we're shutting down (SIGTERM/SIGINT), do NOT request restart
                 if (shuttingDown) {
                     console.error('[Gateway] Connection closed during shutdown — NOT requesting restart');
+                    return;
+                }
+
+                // Status 440 = conflict (another session replaced this one)
+                // This means the R2 auth state is stale. Clear it and exit.
+                // The user must tap 'Start Agent' again to get a fresh pairing code.
+                if (statusCode === 440 || statusCode === '440') {
+                    console.error('[Gateway] Conflict detected (440) — stale session. Clearing auth and stopping.');
+                    try {
+                        if (clearStateFunc) { await clearStateFunc(); console.error('[Gateway] Cleared stale auth state.'); }
+                    } catch (e) { console.error(`[Gateway] Auth cleanup error: ${e.message}`); }
+                    console.log(JSON.stringify({ type: 'connection', status: 'closed' }));
+                    setTimeout(() => process.exit(0), 500);
                     return;
                 }
 

@@ -279,6 +279,8 @@ class _IsolatedAgentController:
             jid = user.get("id")
 
             if status == "open":
+                # Reset reconnect counter on successful connection
+                self.wa_bridge.reconnect_attempts = 0
                 loop.call_soon_threadsafe(
                     lambda: self.on_status_cb(
                         "connected", jid,

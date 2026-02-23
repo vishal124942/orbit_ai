@@ -423,8 +423,9 @@ class SessionManager:
 
     async def restore_active_sessions(self):
         """
-        On startup: restore agents for users that were previously connected.
-        Each session is isolated so one failure doesn't abort others.
+        On startup: mark ALL previously-running sessions as disconnected.
+        Agents only start when the user explicitly taps 'Start Agent'.
+        This prevents phantom code generation on server restart.
         """
         try:
             active = await self.platform_db.get_all_connected_sessions()
@@ -434,7 +435,9 @@ class SessionManager:
 
         for s in active:
             try:
-                logger.info(f"[SessionManager] Restoring session for {s['user_id']}")
-                await self.start_pairing(s["user_id"])
+                uid = s["user_id"]
+                logger.info(f"[SessionManager] Marking session {uid} as disconnected (server restart)")
+                await self.platform_db.set_agent_running(uid, False)
+                await self.platform_db.update_wa_status(uid, "disconnected")
             except Exception as e:
-                logger.error(f"[SessionManager] Failed to restore session for {s['user_id']}: {e}")
+                logger.error(f"[SessionManager] Failed to reset session for {s['user_id']}: {e}")
